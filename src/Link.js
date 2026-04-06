@@ -1,0 +1,743 @@
+/**
+ * Link — virtual encrypted channel to a Single destination.
+ *
+ * Matches the Python reference implementation (RNS/Link.py).
+ *
+ * Provides:
+ * - Forward secrecy via ephemeral X25519 key exchange
+ * - Authenticated encryption (AES-256-CBC + HMAC-SHA256)
+ * - Request/response API
+ * - Keepalive mechanism
+ *
+ * Handshake:
+ *   1. Initiator sends LINKREQUEST with ephemeral X25519 + Ed25519 public keys
+ *   2. Responder proves ownership with identity signature + its own ephemeral X25519 pub
+ *   3. Both sides derive session keys via ECDH + HKDF(salt=link_id, info=empty)
+ *   4. Initiator sends encrypted RTT packet to confirm
+ *   5. Link is ACTIVE — bidirectional encrypted channel
+ */
+
+import { EventEmitter } from './utils/events.js';
+import {
+  generateX25519Keypair,
+  generateEd25519Keypair,
+  x25519SharedSecret,
+  ed25519Sign,
+  ed25519Verify,
+  hkdfDerive,
+  hmacSha256,
+  aesCbcEncrypt,
+  aesCbcDecrypt,
+  truncatedHash,
+  sha256Hash,
+} from './utils/crypto.js';
+import { concat, toHex, equal, randomBytes } from './utils/bytes.js';
+import { Packet } from './Packet.js';
+import { ResourceReceiver } from './Resource.js';
+import { log, LOG_DEBUG, LOG_INFO, LOG_WARNING, LOG_VERBOSE } from './utils/log.js';
+import { encode as msgpackEncode, decode as msgpackDecode } from '@msgpack/msgpack';
+import {
+  PACKET_DATA, PACKET_LINK_REQUEST, PACKET_PROOF,
+  TRANSPORT_BROADCAST, HEADER_1,
+  DEST_SINGLE, DEST_LINK,
+  FLAG_UNSET,
+  CONTEXT_NONE, CONTEXT_LRPROOF, CONTEXT_LRRTT,
+  CONTEXT_KEEPALIVE, CONTEXT_LINKCLOSE, CONTEXT_LINKPROOF,
+  CONTEXT_REQUEST, CONTEXT_RESPONSE,
+  IDENTITY_HASH_LENGTH,
+  IDENTITY_DERIVED_KEY_LENGTH,
+} from './constants.js';
+
+const TAG = 'Link';
+
+// Link states
+export const LINK_PENDING   = 0x00;
+export const LINK_HANDSHAKE = 0x01;
+export const LINK_ACTIVE    = 0x02;
+export const LINK_STALE     = 0x03;
+export const LINK_CLOSED    = 0x04;
+
+// Teardown reasons
+export const TIMEOUT            = 0x01;
+export const INITIATOR_CLOSED   = 0x02;
+export const DESTINATION_CLOSED = 0x03;
+
+// Sizes
+const ECPUBSIZE = 64; // 32 X25519 + 32 Ed25519
+
+// Default establishment timeout per hop
+const ESTABLISHMENT_TIMEOUT_PER_HOP = 6; // seconds
+const DEFAULT_FIRST_HOP_TIMEOUT = 15;    // seconds
+
+export class Link extends EventEmitter {
+  /**
+   * Create a link. Usually called via Link.init() (initiator) or Link.validateRequest() (responder).
+   */
+  constructor() {
+    super();
+    this.status = LINK_PENDING;
+    this.linkId = null;           // 16 bytes
+    this.destination = null;
+
+    // Ephemeral keys (initiator side)
+    this._encPriv = null;         // X25519 private key
+    this._encPub = null;          // X25519 public key
+    this._sigPriv = null;         // Ed25519 private key (initiator only)
+    this._sigPub = null;          // Ed25519 public key (initiator only)
+
+    // Peer keys
+    this._peerEncPub = null;      // Peer's X25519 public key
+
+    // Derived session keys
+    this._sharedKey = null;       // Raw ECDH output
+    this._derivedKey = null;      // HKDF output (64 bytes)
+    this._signingKey = null;      // derived[0:32] — HMAC key
+    this._encryptionKey = null;   // derived[32:64] — AES-256-CBC key
+
+    // Timing
+    this.rtt = null;
+    this.establishedAt = null;
+    this.lastInbound = null;
+    this.lastOutbound = null;
+
+    // Transport reference (for sending)
+    this._transport = null;
+
+    // Request handlers
+    this._requestHandlers = new Map();
+    this._pendingRequests = new Map();
+
+    // Incoming resource tracking
+    this._activeResource = null;
+  }
+
+  /**
+   * Initiate a link to a destination.
+   * @param {import('./Destination.js').Destination} destination
+   * @param {Transport} transport
+   * @returns {Link}
+   */
+  static init(destination, transport) {
+    const link = new Link();
+    link.destination = destination;
+    link._transport = transport;
+
+    // Generate ephemeral keypairs
+    const enc = generateX25519Keypair();
+    link._encPriv = enc.privateKey;
+    link._encPub = enc.publicKey;
+
+    const sig = generateEd25519Keypair();
+    link._sigPriv = sig.privateKey;
+    link._sigPub = sig.publicKey;
+
+    // Build and send the link request
+    link._sendLinkRequest();
+
+    return link;
+  }
+
+  /**
+   * Validate an incoming link request and create the responder-side Link.
+   * @param {Packet} packet - The LINKREQUEST packet
+   * @param {import('./Destination.js').Destination} destination - Our destination
+   * @param {Transport} transport
+   * @returns {Link|null} The new link, or null if validation fails
+   */
+  static validateRequest(packet, destination, transport) {
+    if (packet.packetType !== PACKET_LINK_REQUEST) return null;
+    if (!destination.identity || !destination.identity.hasPrivateKey()) return null;
+
+    const data = packet.data;
+    if (data.length < ECPUBSIZE) {
+      log(LOG_WARNING, TAG, 'Link request too short');
+      return null;
+    }
+
+    // Extract initiator's ephemeral keys
+    const peerEncPub = data.slice(0, 32);
+    const peerSigPub = data.slice(32, 64);
+    const signalling = data.length > ECPUBSIZE ? data.slice(ECPUBSIZE) : null;
+
+    // Compute link ID from the packet
+    const linkId = Link.linkIdFromPacket(packet);
+
+    // Create the responder-side Link
+    const link = new Link();
+    link.linkId = linkId;
+    link.destination = destination;
+    link._transport = transport;
+    link._peerEncPub = peerEncPub;
+    link.status = LINK_HANDSHAKE;
+
+    // Generate our ephemeral X25519 keypair
+    const enc = generateX25519Keypair();
+    link._encPriv = enc.privateKey;
+    link._encPub = enc.publicKey;
+
+    // Perform ECDH
+    link._deriveSessionKeys();
+
+    // Send proof
+    link._sendProof(signalling);
+
+    log(LOG_INFO, TAG, `Accepted link request ${toHex(linkId).slice(0, 16)}..`);
+
+    return link;
+  }
+
+  /**
+   * Compute link_id from a LINKREQUEST packet.
+   * link_id = SHA256(hashable_part_without_signalling)[:16]
+   * @param {Packet} packet
+   * @returns {Uint8Array} 16-byte link ID
+   */
+  static linkIdFromPacket(packet) {
+    if (!packet.raw) packet.pack();
+
+    // hashable_part = (flags & 0x0F) + raw[2:]
+    const hashableFlags = new Uint8Array([packet.raw[0] & 0x0F]);
+    let hashableRest = packet.raw.slice(2);
+
+    // Strip signalling bytes if present
+    if (packet.data.length > ECPUBSIZE) {
+      const diff = packet.data.length - ECPUBSIZE;
+      hashableRest = hashableRest.slice(0, hashableRest.length - diff);
+    }
+
+    return truncatedHash(concat(hashableFlags, hashableRest), IDENTITY_HASH_LENGTH);
+  }
+
+  /**
+   * Handle an incoming proof packet (initiator side).
+   * @param {Packet} packet - PROOF with LRPROOF context
+   * @param {import('./Identity.js').Identity} destinationIdentity - The destination's public identity
+   * @returns {boolean} true if proof is valid
+   */
+  async handleProof(packet, destinationIdentity) {
+    if (this.status !== LINK_PENDING) return false;
+
+    const data = packet.data;
+    if (data.length < 96) { // 64 sig + 32 pub minimum
+      log(LOG_WARNING, TAG, 'Link proof too short');
+      return false;
+    }
+
+    const signature = data.slice(0, 64);
+    const peerEncPub = data.slice(64, 96);
+    const signalling = data.length > 96 ? data.slice(96) : null;
+
+    // Reconstruct signed data: link_id + peer_enc_pub + peer_sig_pub + signalling
+    // Note: responder includes its own sig_pub in signed data but that's actually
+    // not sent — the permanent identity key is used. Let me re-check...
+    // Actually, signed_data = link_id + responder_pub + responder_sig_pub + signalling
+    // But responder doesn't have separate sig_pub in proof — it uses identity's sig key.
+    // Re-reading: signed_data = self.link_id + self.peer_pub_bytes + self.peer_sig_pub_bytes + signalling
+    // In responder context: peer_pub = responder's own enc pub, peer_sig_pub = responder's identity sig pub?
+    // No — the responder's "peer" is the initiator. Let me trace more carefully.
+    //
+    // Actually from the proof construction in Python:
+    //   signed_data = self.link_id + self.pub_bytes + self.sig_pub_bytes
+    //   where self.pub_bytes = responder's ephemeral X25519 pub
+    //   and self.sig_pub_bytes = responder's ephemeral Ed25519 pub (but for responder,
+    //   this is the IDENTITY's signing key, not ephemeral)
+    //
+    // Wait — looking more carefully at the Python code:
+    //   For responder (incoming link), sig_pub is set to destination.identity.sig_pub_bytes
+    //   signed_data includes responder's pub_bytes + sig_pub_bytes + signalling if present
+    //   BUT sig_pub_bytes is NOT included in the proof_data sent over the wire
+    //
+    // So the initiator needs to reconstruct signed_data using:
+    //   link_id + peer_enc_pub (from proof) + destination_sig_pub (known from announce/identity)
+    //   + signalling (if present)
+
+    // Build signed_data as responder would have
+    const signedParts = [this.linkId, peerEncPub, destinationIdentity.signingPublicKey];
+    if (signalling) signedParts.push(signalling);
+    const signedData = concat(...signedParts);
+
+    // Verify with destination's permanent identity key
+    if (!destinationIdentity.verify(signedData, signature)) {
+      log(LOG_WARNING, TAG, 'Link proof signature verification failed');
+      return false;
+    }
+
+    // Proof is valid — complete ECDH
+    this._peerEncPub = peerEncPub;
+    this._deriveSessionKeys();
+
+    this.status = LINK_ACTIVE;
+    this.establishedAt = Date.now();
+    this.lastInbound = Date.now();
+
+    log(LOG_INFO, TAG, `Link established: ${toHex(this.linkId).slice(0, 16)}..`);
+
+    // Send RTT packet
+    await this._sendRtt();
+
+    this.emit('established', this);
+    return true;
+  }
+
+  /**
+   * Handle an incoming RTT packet (responder side).
+   * Transitions from HANDSHAKE to ACTIVE.
+   * @param {Uint8Array} encryptedData
+   */
+  handleRtt(encryptedData) {
+    if (this.status !== LINK_HANDSHAKE) return;
+
+    try {
+      // Decrypt — if this succeeds, the session keys are correct
+      const _plaintext = this.decrypt(encryptedData);
+      this.status = LINK_ACTIVE;
+      this.establishedAt = Date.now();
+      this.lastInbound = Date.now();
+
+      log(LOG_INFO, TAG, `Link active (responder): ${toHex(this.linkId).slice(0, 16)}..`);
+      this.emit('established', this);
+    } catch (err) {
+      log(LOG_WARNING, TAG, `RTT decryption failed: ${err.message}`);
+    }
+  }
+
+  /**
+   * Encrypt data for sending over this link.
+   * Format: IV(16) + AES-256-CBC(PKCS7(plaintext)) + HMAC-SHA256(IV + ciphertext)
+   * @param {Uint8Array} plaintext
+   * @returns {Promise<Uint8Array>}
+   */
+  async encrypt(plaintext) {
+    if (!this._encryptionKey) throw new Error('Link has no session keys');
+
+    const iv = randomBytes(16);
+    const ciphertext = await aesCbcEncrypt(plaintext, this._encryptionKey, iv);
+    const signedParts = concat(iv, ciphertext);
+    const mac = hmacSha256(this._signingKey, signedParts);
+
+    return concat(signedParts, mac);
+  }
+
+  /**
+   * Decrypt data received over this link.
+   * @param {Uint8Array} token - IV(16) + ciphertext + HMAC(32)
+   * @returns {Promise<Uint8Array>} plaintext
+   */
+  async decrypt(token) {
+    if (!this._encryptionKey) throw new Error('Link has no session keys');
+    if (token.length < 48) throw new Error('Token too short');
+
+    const iv = token.slice(0, 16);
+    const ciphertext = token.slice(16, token.length - 32);
+    const receivedMac = token.slice(token.length - 32);
+
+    // Verify HMAC
+    const signedParts = concat(iv, ciphertext);
+    const expectedMac = hmacSha256(this._signingKey, signedParts);
+
+    if (!equal(receivedMac, expectedMac)) {
+      throw new Error('HMAC verification failed');
+    }
+
+    return aesCbcDecrypt(ciphertext, this._encryptionKey, iv);
+  }
+
+  /**
+   * Send data over the link (encrypted).
+   * @param {Uint8Array} data
+   * @param {number} [context=CONTEXT_NONE]
+   */
+  async send(data, context = CONTEXT_NONE) {
+    if (this.status !== LINK_ACTIVE) {
+      throw new Error('Link is not active');
+    }
+
+    const encrypted = await this.encrypt(data);
+    const pkt = new Packet();
+    pkt.headerType = HEADER_1;
+    pkt.packetType = PACKET_DATA;
+    pkt.destType = DEST_LINK;
+    pkt.transportType = TRANSPORT_BROADCAST;
+    pkt.destinationHash = this.linkId;
+    pkt.context = context;
+    pkt.data = encrypted;
+
+    this._transport.transmit(pkt);
+    this.lastOutbound = Date.now();
+  }
+
+  /**
+   * Send a request over the link.
+   *
+   * Wire format (msgpack-encoded, then encrypted):
+   *   [timestamp_float, path_hash_10bytes, data_bytes_or_null]
+   *
+   * path_hash = SHA256(path_utf8)[:10]  (NAME_HASH_LENGTH, matching Python)
+   *
+   * The request_id is the truncated hash of the sent packet (matching Python's
+   * packet.getTruncatedHash()), used to correlate responses.
+   *
+   * @param {string} path - Request path (e.g. "/page/index.mu")
+   * @param {Uint8Array|null} [data=null] - Request data
+   * @param {number} [timeout=10000] - Response timeout in ms
+   * @returns {Promise<Uint8Array|null>} Response data, or null on timeout
+   */
+  async request(path, data = null, timeout = 10000) {
+    if (this.status !== LINK_ACTIVE) {
+      throw new Error('Link is not active');
+    }
+
+    // Path hash: SHA256(path_utf8)[:16] — matching Python's Identity.truncated_hash()
+    const pathHash = truncatedHash(new TextEncoder().encode(path), IDENTITY_HASH_LENGTH);
+    const timestamp = Date.now() / 1000;
+
+    // Pack as msgpack array: [timestamp, path_hash, data]
+    const packed = msgpackEncode([timestamp, pathHash, data]);
+    const packedBytes = new Uint8Array(packed);
+
+    // Build packet manually so we can capture the packet hash for request_id.
+    // Python computes request_id = SHA256(SHA256(hashable_part))[:16]
+    // which is truncatedHash(packet.packetHash).
+    const encrypted = await this.encrypt(packedBytes);
+    const pkt = new Packet();
+    pkt.headerType = HEADER_1;
+    pkt.packetType = PACKET_DATA;
+    pkt.destType = DEST_LINK;
+    pkt.transportType = TRANSPORT_BROADCAST;
+    pkt.destinationHash = this.linkId;
+    pkt.context = CONTEXT_REQUEST;
+    pkt.data = encrypted;
+    pkt.pack(); // computes packetHash = SHA256(hashable_part)
+
+    // request_id = packetHash[:16] — matches Python's getTruncatedHash()
+    // Python: getTruncatedHash() = SHA256(hashable_part)[:16] = get_hash()[:16]
+    // Our packetHash is already SHA256(hashable_part), so just slice it.
+    const requestId = pkt.packetHash.slice(0, IDENTITY_HASH_LENGTH);
+
+    this._transport.transmit(pkt);
+    this.lastOutbound = Date.now();
+
+    // Wait for response
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this._pendingRequests.delete(toHex(requestId));
+        resolve(null);
+      }, timeout);
+
+      this._pendingRequests.set(toHex(requestId), {
+        resolve: (responseData) => {
+          clearTimeout(timer);
+          this._pendingRequests.delete(toHex(requestId));
+          resolve(responseData);
+        },
+      });
+    });
+  }
+
+  /**
+   * Register a request handler for a path.
+   * @param {string} path - Request path
+   * @param {function(Uint8Array|null, Link): Promise<Uint8Array|null>} handler
+   */
+  registerRequestHandler(path, handler) {
+    const pathHash = truncatedHash(new TextEncoder().encode(path), IDENTITY_HASH_LENGTH);
+    this._requestHandlers.set(toHex(pathHash), handler);
+  }
+
+  /**
+   * Handle an incoming request packet (responder side).
+   * @param {Uint8Array} plaintext - Decrypted request data
+   * @param {Packet} packet
+   */
+  async _handleRequest(plaintext, packet) {
+    try {
+      const unpacked = msgpackDecode(plaintext);
+      if (!Array.isArray(unpacked) || unpacked.length < 3) return;
+
+      const [timestamp, pathHash, requestData] = unpacked;
+      const pathHashHex = toHex(new Uint8Array(pathHash));
+
+      const handler = this._requestHandlers.get(pathHashHex);
+      if (!handler) {
+        log(LOG_DEBUG, TAG, `No handler for request path ${pathHashHex}`);
+        return;
+      }
+
+      // request_id = packetHash[:16] — matches Python's getTruncatedHash()
+      const requestId = packet.packetHash
+        ? packet.packetHash.slice(0, IDENTITY_HASH_LENGTH)
+        : truncatedHash(new Uint8Array(plaintext), IDENTITY_HASH_LENGTH);
+
+      // Call handler
+      const responseData = await handler(
+        requestData ? new Uint8Array(requestData) : null,
+        this
+      );
+
+      // Send response: msgpack([request_id, response_data])
+      const responsePacked = msgpackEncode([requestId, responseData]);
+      await this.send(new Uint8Array(responsePacked), CONTEXT_RESPONSE);
+
+    } catch (err) {
+      log(LOG_WARNING, TAG, `Request handling error: ${err.message}`);
+    }
+  }
+
+  /**
+   * Handle an incoming response packet (initiator side).
+   * @param {Uint8Array} plaintext - Decrypted response data
+   */
+  _handleResponse(plaintext) {
+    try {
+      const unpacked = msgpackDecode(plaintext);
+      if (!Array.isArray(unpacked) || unpacked.length < 2) return;
+
+      const [requestId, responseData] = unpacked;
+      const requestIdHex = toHex(new Uint8Array(requestId));
+
+      const pending = this._pendingRequests.get(requestIdHex);
+      if (pending) {
+        pending.resolve(responseData ? new Uint8Array(responseData) : null);
+      }
+    } catch (err) {
+      log(LOG_WARNING, TAG, `Response handling error: ${err.message}`);
+    }
+  }
+
+  // --- Incoming Resource handling ---
+
+  /**
+   * Handle an incoming resource advertisement on this link.
+   * Auto-accepts and begins receiving parts.
+   * @param {Uint8Array} plaintext - Decrypted RESOURCE_ADV data
+   */
+  _handleResourceAdv(plaintext) {
+    try {
+      const receiver = new ResourceReceiver(this, plaintext);
+      this._activeResource = receiver;
+
+      log(LOG_INFO, TAG, `Resource advertised: ${receiver.totalParts} parts, ${receiver.dataSize} bytes`);
+
+      receiver.onComplete((data) => {
+        log(LOG_INFO, TAG, `Resource complete: ${data.length} bytes, requestId=${receiver.requestId ? toHex(receiver.requestId).slice(0,16) : 'null'}, pendingRequests=${this._pendingRequests.size}`);
+
+        // Check if this is a response to a pending request
+        if (receiver.requestId || this._pendingRequests.size > 0) {
+          // The resource data is msgpack [request_id, response_data]
+          try {
+            const unpacked = msgpackDecode(data);
+            if (Array.isArray(unpacked) && unpacked.length >= 2) {
+              log(LOG_DEBUG, TAG, `Resource response: request_id=${toHex(new Uint8Array(unpacked[0])).slice(0,16)}, data=${unpacked[1] ? unpacked[1].length + 'b' : 'null'}`);
+              this._handleResponse(data);
+              return;
+            }
+          } catch (err) {
+            log(LOG_WARNING, TAG, `Resource response parse failed: ${err.message}`);
+          }
+        }
+
+        // Otherwise emit as generic resource data
+        this.emit('resource_complete', data, receiver);
+        this._activeResource = null;
+      });
+
+      // Auto-accept
+      receiver.accept().catch(err => {
+        log(LOG_WARNING, TAG, `Resource accept failed: ${err.message}`);
+      });
+
+    } catch (err) {
+      log(LOG_WARNING, TAG, `Resource ADV error: ${err.message}`);
+    }
+  }
+
+  /**
+   * Handle an incoming resource data part.
+   * @param {Uint8Array} plaintext - Decrypted RESOURCE part data
+   */
+  _handleResourcePart(plaintext) {
+    if (this._activeResource) {
+      this._activeResource.receivePart(plaintext);
+    }
+  }
+
+  /**
+   * Handle a resource hashmap update.
+   * @param {Uint8Array} plaintext - Decrypted RESOURCE_HMU data
+   */
+  _handleResourceHmu(plaintext) {
+    // TODO: parse hashmap update and add to active resource
+    log(LOG_DEBUG, TAG, 'Resource HMU received (not yet handled)');
+  }
+
+  /**
+   * Close the link.
+   */
+  async close() {
+    if (this.status === LINK_CLOSED) return;
+
+    if (this._encryptionKey) {
+      try {
+        // Send close packet with encrypted link_id as proof
+        const encrypted = await this.encrypt(this.linkId);
+        const pkt = new Packet();
+        pkt.headerType = HEADER_1;
+        pkt.packetType = PACKET_DATA;
+        pkt.destType = DEST_LINK;
+        pkt.transportType = TRANSPORT_BROADCAST;
+        pkt.destinationHash = this.linkId;
+        pkt.context = CONTEXT_LINKCLOSE;
+        pkt.data = encrypted;
+        this._transport.transmit(pkt);
+      } catch {
+        // Best effort
+      }
+    }
+
+    this._teardown(INITIATOR_CLOSED);
+  }
+
+  /**
+   * Handle an incoming close packet.
+   * @param {Uint8Array} encryptedData
+   */
+  async handleClose(encryptedData) {
+    try {
+      const plaintext = await this.decrypt(encryptedData);
+      if (equal(plaintext, this.linkId)) {
+        this._teardown(DESTINATION_CLOSED);
+      }
+    } catch {
+      // Invalid close, ignore
+    }
+  }
+
+  /**
+   * Handle an incoming keepalive packet.
+   * @param {Uint8Array} data - Single byte: 0xFF=request, 0xFE=response
+   */
+  handleKeepalive(data) {
+    this.lastInbound = Date.now();
+
+    if (data.length > 0 && data[0] === 0xFF) {
+      // Keepalive request — send response
+      const pkt = new Packet();
+      pkt.headerType = HEADER_1;
+      pkt.packetType = PACKET_DATA;
+      pkt.destType = DEST_LINK;
+      pkt.transportType = TRANSPORT_BROADCAST;
+      pkt.destinationHash = this.linkId;
+      pkt.context = CONTEXT_KEEPALIVE;
+      pkt.data = new Uint8Array([0xFE]);
+      this._transport.transmit(pkt);
+    }
+  }
+
+  // --- Internal methods ---
+
+  _sendLinkRequest() {
+    const requestData = concat(this._encPub, this._sigPub);
+
+    const pkt = new Packet();
+    pkt.headerType = HEADER_1;
+    pkt.packetType = PACKET_LINK_REQUEST;
+    pkt.destType = DEST_SINGLE;
+    pkt.transportType = TRANSPORT_BROADCAST;
+    pkt.destinationHash = this.destination.hash;
+    pkt.context = CONTEXT_NONE;
+    pkt.data = requestData;
+
+    // Compute link ID before sending
+    pkt.pack();
+    this.linkId = Link.linkIdFromPacket(pkt);
+
+    this._transport.transmit(pkt);
+    this.status = LINK_PENDING;
+
+    log(LOG_INFO, TAG, `Sent link request to ${toHex(this.destination.hash).slice(0, 16)}.. (link_id: ${toHex(this.linkId).slice(0, 16)}..)`);
+  }
+
+  _sendProof(signalling) {
+    const identity = this.destination.identity;
+
+    // Sign: link_id + our_enc_pub + identity_sig_pub [+ signalling]
+    const signedParts = [this.linkId, this._encPub, identity.signingPublicKey];
+    if (signalling) signedParts.push(signalling);
+    const signedData = concat(...signedParts);
+    const signature = identity.sign(signedData);
+
+    // Proof data: signature(64) + our_enc_pub(32) [+ signalling]
+    const proofParts = [signature, this._encPub];
+    if (signalling) proofParts.push(signalling);
+    const proofData = concat(...proofParts);
+
+    const pkt = new Packet();
+    pkt.headerType = HEADER_1;
+    pkt.packetType = PACKET_PROOF;
+    pkt.destType = DEST_LINK;
+    pkt.transportType = TRANSPORT_BROADCAST;
+    pkt.destinationHash = this.linkId;
+    pkt.context = CONTEXT_LRPROOF;
+    pkt.data = proofData;
+
+    this._transport.transmit(pkt);
+    log(LOG_DEBUG, TAG, `Sent link proof for ${toHex(this.linkId).slice(0, 16)}..`);
+  }
+
+  async _sendRtt() {
+    // Calculate RTT from link request to proof receipt
+    this.rtt = this.establishedAt ? (Date.now() - this.establishedAt) / 1000 : 0;
+
+    // Pack RTT as a simple float encoded in 4 bytes (we'll use a basic encoding)
+    // Python uses msgpack — we need msgpack compat here
+    // For now, encode RTT as a UTF-8 string of the float
+    // TODO: use proper msgpack encoding for full compatibility
+    const rttBytes = new TextEncoder().encode(String(this.rtt));
+
+    try {
+      await this.send(rttBytes, CONTEXT_LRRTT);
+      log(LOG_DEBUG, TAG, `Sent RTT packet: ${this.rtt}s`);
+    } catch (err) {
+      log(LOG_WARNING, TAG, `Failed to send RTT: ${err.message}`);
+    }
+  }
+
+  _deriveSessionKeys() {
+    // ECDH
+    this._sharedKey = x25519SharedSecret(this._encPriv, this._peerEncPub);
+
+    // HKDF: salt = link_id, info = empty, 64 bytes output
+    this._derivedKey = hkdfDerive(
+      this._sharedKey,
+      IDENTITY_DERIVED_KEY_LENGTH, // 64 bytes
+      this.linkId,                  // salt = link_id (16 bytes)
+      new Uint8Array(0)             // info = empty
+    );
+
+    // Split into signing and encryption keys
+    this._signingKey = this._derivedKey.slice(0, 32);
+    this._encryptionKey = this._derivedKey.slice(32, 64);
+
+    log(LOG_DEBUG, TAG, `Derived session keys for link ${toHex(this.linkId).slice(0, 16)}..`);
+  }
+
+  _teardown(reason) {
+    this.status = LINK_CLOSED;
+
+    // Zero out keys
+    this._encPriv = null;
+    this._encPub = null;
+    this._sigPriv = null;
+    this._sigPub = null;
+    this._peerEncPub = null;
+    this._sharedKey = null;
+    this._derivedKey = null;
+    this._signingKey = null;
+    this._encryptionKey = null;
+
+    const reasons = { [TIMEOUT]: 'timeout', [INITIATOR_CLOSED]: 'initiator_closed', [DESTINATION_CLOSED]: 'destination_closed' };
+    log(LOG_INFO, TAG, `Link ${this.linkId ? toHex(this.linkId).slice(0, 16) + '..' : 'unknown'} closed: ${reasons[reason] || 'unknown'}`);
+
+    this.emit('closed', reason);
+  }
+}

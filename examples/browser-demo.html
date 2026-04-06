@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Reticulum Browser Client</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+    background: #0a0e14;
+    color: #b3b1ad;
+    padding: 20px;
+    max-width: 900px;
+    margin: 0 auto;
+  }
+  h1 { color: #e6b450; margin-bottom: 4px; font-size: 1.4em; }
+  h2 { color: #59c2ff; margin: 16px 0 8px; font-size: 1.1em; }
+  .subtitle { color: #626a73; font-size: 0.85em; margin-bottom: 16px; }
+
+  .panel {
+    background: #0d1117;
+    border: 1px solid #1a1f26;
+    border-radius: 6px;
+    padding: 12px 16px;
+    margin-bottom: 12px;
+  }
+
+  .status-bar {
+    display: flex;
+    gap: 20px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .status-item { display: flex; align-items: center; gap: 6px; }
+  .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    display: inline-block;
+  }
+  .dot.green { background: #7fd962; }
+  .dot.red { background: #f26d78; }
+  .dot.yellow { background: #e6b450; }
+
+  .controls {
+    display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+  }
+  input[type="text"], input[type="number"] {
+    background: #131820;
+    border: 1px solid #2a2f36;
+    color: #b3b1ad;
+    padding: 6px 10px;
+    border-radius: 4px;
+    font-family: inherit;
+    font-size: 0.9em;
+  }
+  input:focus { border-color: #59c2ff; outline: none; }
+
+  button {
+    background: #1a1f26;
+    color: #59c2ff;
+    border: 1px solid #2a3040;
+    padding: 6px 14px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 0.9em;
+  }
+  button:hover { background: #242a35; border-color: #59c2ff; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.primary { background: #1a3050; border-color: #59c2ff; }
+  button.danger { color: #f26d78; border-color: #f26d78; }
+
+  .log {
+    background: #080b10;
+    border: 1px solid #1a1f26;
+    border-radius: 4px;
+    padding: 8px 12px;
+    height: 300px;
+    overflow-y: auto;
+    font-size: 0.82em;
+    line-height: 1.5;
+  }
+  .log-entry { border-bottom: 1px solid #0d1117; padding: 2px 0; }
+  .log-entry .time { color: #626a73; }
+  .log-entry .type-announce { color: #7fd962; }
+  .log-entry .type-info { color: #59c2ff; }
+  .log-entry .type-error { color: #f26d78; }
+  .log-entry .type-data { color: #e6b450; }
+  .log-entry .hash { color: #d4bfff; }
+
+  .identity-info {
+    font-size: 0.85em;
+    word-break: break-all;
+  }
+  .identity-info .label { color: #626a73; display: inline-block; width: 120px; }
+  .identity-info .value { color: #d4bfff; }
+
+  .announce-table {
+    width: 100%;
+    font-size: 0.82em;
+    border-collapse: collapse;
+  }
+  .announce-table th {
+    text-align: left;
+    color: #626a73;
+    padding: 4px 8px;
+    border-bottom: 1px solid #1a1f26;
+  }
+  .announce-table td {
+    padding: 4px 8px;
+    border-bottom: 1px solid #0d1117;
+  }
+  .announce-table .hash-col { color: #d4bfff; font-size: 0.95em; }
+  .announce-table .app-col { color: #e6b450; }
+  .announce-table .hops-col { color: #626a73; text-align: center; }
+</style>
+</head>
+<body>
+
+<h1>Reticulum Browser Client</h1>
+<div class="subtitle">RNS network access via WebSocket bridge</div>
+
+<!-- Connection -->
+<div class="panel">
+  <div class="controls">
+    <span>Bridge URL:</span>
+    <input type="text" id="ws-url" value="ws://localhost:8765" style="width: 220px" />
+    <button id="btn-connect" class="primary" onclick="toggleConnect()">Connect</button>
+    <span class="status-item">
+      <span class="dot" id="status-dot"></span>
+      <span id="status-text">Disconnected</span>
+    </span>
+  </div>
+</div>
+
+<!-- Identity -->
+<h2>Identity</h2>
+<div class="panel">
+  <div id="identity-panel" class="identity-info">
+    <div><span class="label">Hash:</span> <span class="value" id="id-hash">-</span></div>
+    <div><span class="label">Public Key:</span> <span class="value" id="id-pubkey" style="font-size:0.8em">-</span></div>
+  </div>
+  <div style="margin-top: 8px" class="controls">
+    <button onclick="newIdentity()">New Identity</button>
+    <button onclick="sendAnnounce()" id="btn-announce" disabled>Send Announce</button>
+    <input type="text" id="announce-appdata" placeholder="App data (optional)" style="width: 180px" />
+  </div>
+</div>
+
+<!-- Stats -->
+<div class="panel status-bar" id="stats-bar">
+  <div class="status-item">Packets: <strong id="stat-packets">0</strong></div>
+  <div class="status-item">Announces: <strong id="stat-announces">0</strong></div>
+  <div class="status-item">Known Dests: <strong id="stat-dests">0</strong></div>
+</div>
+
+<!-- Announce Table -->
+<h2>Network Announces</h2>
+<div class="panel" style="max-height: 250px; overflow-y: auto;">
+  <table class="announce-table">
+    <thead>
+      <tr><th>Destination</th><th>Identity</th><th style="text-align:center">Hops</th><th>App Data</th><th>Time</th></tr>
+    </thead>
+    <tbody id="announce-tbody"></tbody>
+  </table>
+</div>
+
+<!-- Log -->
+<h2>Event Log</h2>
+<div class="log" id="log"></div>
+
+<!-- Load the UMD bundle. Adjust path if needed. -->
+<script src="../dist/reticulum.umd.js"></script>
+<script>
+// --- Globals ---
+const R = window.Reticulum;
+let transport = null;
+let wsInterface = null;
+let identity = null;
+let destination = null;
+let connected = false;
+let stats = { packets: 0, announces: 0 };
+let announceList = [];
+
+// --- UI Helpers ---
+function $(id) { return document.getElementById(id); }
+
+function logEntry(type, message) {
+  const el = $('log');
+  const time = new Date().toLocaleTimeString();
+  const div = document.createElement('div');
+  div.className = 'log-entry';
+  div.innerHTML = `<span class="time">${time}</span> <span class="type-${type}">[${type.toUpperCase()}]</span> ${message}`;
+  el.prepend(div);
+  // Keep max 200 entries
+  while (el.children.length > 200) el.removeChild(el.lastChild);
+}
+
+function updateStatus(online) {
+  connected = online;
+  $('status-dot').className = 'dot ' + (online ? 'green' : 'red');
+  $('status-text').textContent = online ? 'Connected' : 'Disconnected';
+  $('btn-connect').textContent = online ? 'Disconnect' : 'Connect';
+  $('btn-connect').className = online ? 'danger' : 'primary';
+  $('btn-announce').disabled = !online || !identity;
+}
+
+function updateStats() {
+  $('stat-packets').textContent = stats.packets;
+  $('stat-announces').textContent = stats.announces;
+  $('stat-dests').textContent = transport ? transport.announceTable.size : 0;
+}
+
+function updateIdentity() {
+  if (identity) {
+    $('id-hash').textContent = identity.hexHash;
+    $('id-pubkey').textContent = R.toHex(identity.publicKey);
+    $('btn-announce').disabled = !connected;
+  } else {
+    $('id-hash').textContent = '-';
+    $('id-pubkey').textContent = '-';
+    $('btn-announce').disabled = true;
+  }
+}
+
+function addAnnounceRow(info) {
+  const tbody = $('announce-tbody');
+  const destHex = R.toHex(info.destinationHash);
+  const idHex = info.identity.hexHash;
+  let appStr = '';
+  if (info.appData) {
+    try {
+      const s = new TextDecoder().decode(info.appData);
+      if (/^[\x20-\x7E]+$/.test(s)) appStr = s;
+      else appStr = `(${info.appData.length}b)`;
+    } catch { appStr = `(${info.appData.length}b)`; }
+  }
+  const time = new Date().toLocaleTimeString();
+
+  const tr = document.createElement('tr');
+  tr.innerHTML = `
+    <td class="hash-col" title="${destHex}">${destHex.slice(0, 16)}..</td>
+    <td class="hash-col" title="${idHex}">${idHex.slice(0, 12)}..</td>
+    <td class="hops-col">${info.hops}</td>
+    <td class="app-col">${escapeHtml(appStr)}</td>
+    <td style="color:#626a73">${time}</td>
+  `;
+  tbody.prepend(tr);
+
+  // Keep max 100 rows
+  while (tbody.children.length > 100) tbody.removeChild(tbody.lastChild);
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// --- Actions ---
+async function toggleConnect() {
+  if (connected) {
+    await disconnect();
+  } else {
+    await connect();
+  }
+}
+
+async function connect() {
+  const url = $('ws-url').value.trim();
+  if (!url) return;
+
+  logEntry('info', `Connecting to ${url}...`);
+
+  transport = new R.Transport();
+  wsInterface = new R.WebSocketClientInterface('Browser', url);
+  transport.registerInterface(wsInterface);
+
+  // Listen for announces
+  transport.on('announce', (info) => {
+    stats.announces++;
+    updateStats();
+    const destHex = R.toHex(info.destinationHash);
+    let appStr = '';
+    if (info.appData) {
+      try { appStr = new TextDecoder().decode(info.appData); } catch {}
+    }
+    logEntry('announce', `<span class="hash">${destHex.slice(0,16)}..</span> hops=${info.hops}${appStr ? ' "' + escapeHtml(appStr) + '"' : ''}`);
+    addAnnounceRow(info);
+  });
+
+  // Count raw packets
+  wsInterface.on('packet', () => {
+    stats.packets++;
+    updateStats();
+  });
+
+  try {
+    await wsInterface.start();
+    updateStatus(true);
+    logEntry('info', 'Connected to bridge');
+
+    // Generate identity if we don't have one
+    if (!identity) newIdentity();
+  } catch (err) {
+    logEntry('error', `Connection failed: ${err.message}`);
+    updateStatus(false);
+  }
+}
+
+async function disconnect() {
+  if (wsInterface) {
+    await wsInterface.stop();
+    wsInterface = null;
+  }
+  transport = null;
+  updateStatus(false);
+  logEntry('info', 'Disconnected');
+}
+
+function newIdentity() {
+  identity = R.Identity.generate();
+  updateIdentity();
+  logEntry('info', `New identity: <span class="hash">${identity.hexHash}</span>`);
+
+  // Create a destination
+  destination = new R.Destination(
+    identity, R.DEST_IN, R.DEST_SINGLE,
+    'browser_rns', 'demo'
+  );
+  logEntry('info', `Destination: <span class="hash">${R.toHex(destination.hash)}</span>`);
+}
+
+function sendAnnounce() {
+  if (!transport || !destination || !connected) return;
+
+  const appDataStr = $('announce-appdata').value.trim() || 'Browser RNS Client';
+  const appData = new TextEncoder().encode(appDataStr);
+
+  const pkt = R.createAnnounce(destination, appData);
+  transport.transmit(pkt);
+
+  logEntry('data', `Sent announce: "${escapeHtml(appDataStr)}"`);
+}
+
+// --- Init ---
+updateStatus(false);
+logEntry('info', 'Ready. Enter bridge URL and click Connect.');
+logEntry('info', 'Start the bridge server: python examples/bridge-server.py');
+</script>
+
+</body>
+</html>

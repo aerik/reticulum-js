@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RNS Mesh Chat</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: #0f1419;
+    color: #e7e9ea;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* Header */
+  .header {
+    background: #16202a;
+    border-bottom: 1px solid #2f3336;
+    padding: 10px 16px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-shrink: 0;
+  }
+  .header h1 { font-size: 1.1em; color: #1d9bf0; font-weight: 600; }
+  .header .conn-bar {
+    display: flex; align-items: center; gap: 8px; margin-left: auto;
+  }
+  .header input {
+    background: #202327; border: 1px solid #333639; color: #e7e9ea;
+    padding: 5px 10px; border-radius: 4px; font-size: 0.85em; width: 180px;
+  }
+  .header button {
+    padding: 5px 12px; border-radius: 16px; font-size: 0.85em;
+    border: none; cursor: pointer; font-weight: 600;
+  }
+  .btn-connect { background: #1d9bf0; color: white; }
+  .btn-connect:hover { background: #1a8cd8; }
+  .btn-disconnect { background: #67070f; color: #f4212e; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .dot.on { background: #00ba7c; }
+  .dot.off { background: #f4212e; }
+  .dot.reconnecting { background: #ffd400; animation: pulse 1s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+  /* Main layout */
+  .main { display: flex; flex: 1; overflow: hidden; }
+
+  /* Left sidebar - network nodes */
+  .sidebar {
+    width: 280px; background: #16202a; border-right: 1px solid #2f3336;
+    display: flex; flex-direction: column; flex-shrink: 0;
+  }
+  .sidebar-header {
+    padding: 12px; border-bottom: 1px solid #2f3336;
+    font-weight: 600; font-size: 0.9em; color: #8b98a5;
+  }
+  .node-list { flex: 1; overflow-y: auto; }
+  .node-item {
+    padding: 10px 12px; border-bottom: 1px solid #2f3336;
+    cursor: pointer; transition: background 0.15s;
+  }
+  .node-item:hover { background: #1c2732; }
+  .node-item.active { background: #1d2f3f; border-left: 3px solid #1d9bf0; }
+  .node-item .hash { font-family: monospace; font-size: 0.8em; color: #8b98a5; }
+  .node-item .app { color: #e7e9ea; font-size: 0.9em; margin-top: 2px; }
+  .node-item .meta { font-size: 0.75em; color: #536471; margin-top: 2px; }
+
+  /* Identity bar */
+  .identity-bar {
+    padding: 10px 12px; border-top: 1px solid #2f3336;
+    font-size: 0.8em;
+  }
+  .identity-bar .label { color: #536471; }
+  .identity-bar .value { color: #1d9bf0; font-family: monospace; }
+  .identity-bar button {
+    margin-top: 6px; padding: 4px 10px; border-radius: 12px;
+    background: #1d2f3f; color: #1d9bf0; border: 1px solid #1d4668;
+    cursor: pointer; font-size: 0.85em;
+  }
+  .identity-bar button:hover { background: #1d3a50; }
+
+  /* Chat area */
+  .chat-area {
+    flex: 1; display: flex; flex-direction: column;
+  }
+  .chat-header {
+    padding: 12px 16px; border-bottom: 1px solid #2f3336;
+    background: #16202a; display: flex; align-items: center; gap: 10px;
+  }
+  .chat-header .target { font-family: monospace; color: #8b98a5; font-size: 0.85em; }
+  .chat-header .link-status { font-size: 0.8em; }
+  .chat-header .link-status.active { color: #00ba7c; }
+  .chat-header .link-status.pending { color: #ffd400; }
+  .chat-header .link-status.none { color: #536471; }
+
+  .messages {
+    flex: 1; overflow-y: auto; padding: 12px 16px;
+    display: flex; flex-direction: column; gap: 6px;
+  }
+  .msg {
+    max-width: 75%; padding: 8px 12px; border-radius: 16px;
+    font-size: 0.9em; line-height: 1.4; word-wrap: break-word;
+  }
+  .msg.sent { align-self: flex-end; background: #1d9bf0; color: white; }
+  .msg.received { align-self: flex-start; background: #2f3336; }
+  .msg.system {
+    align-self: center; background: transparent; color: #536471;
+    font-size: 0.8em; font-style: italic;
+  }
+  .msg .sender { font-size: 0.75em; color: rgba(255,255,255,0.6); margin-bottom: 2px; }
+  .msg .time { font-size: 0.7em; color: rgba(255,255,255,0.4); margin-top: 2px; text-align: right; }
+
+  .input-bar {
+    padding: 10px 16px; border-top: 1px solid #2f3336;
+    display: flex; gap: 8px; background: #16202a;
+  }
+  .input-bar input {
+    flex: 1; background: #202327; border: 1px solid #333639; color: #e7e9ea;
+    padding: 10px 14px; border-radius: 20px; font-size: 0.9em; outline: none;
+  }
+  .input-bar input:focus { border-color: #1d9bf0; }
+  .input-bar button {
+    background: #1d9bf0; color: white; border: none; border-radius: 50%;
+    width: 38px; height: 38px; cursor: pointer; font-size: 1.1em;
+  }
+  .input-bar button:disabled { opacity: 0.3; cursor: not-allowed; }
+
+  /* Empty state */
+  .empty-state {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    color: #536471; font-size: 0.95em; text-align: center; padding: 40px;
+  }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+  <h1>RNS Mesh Chat</h1>
+  <div class="conn-bar">
+    <span class="dot off" id="conn-dot"></span>
+    <input type="text" id="ws-url" value="ws://localhost:8765" placeholder="Bridge URL" />
+    <button class="btn-connect" id="btn-conn" onclick="toggleConnection()">Connect</button>
+  </div>
+</div>
+
+<!-- Main -->
+<div class="main">
+
+  <!-- Sidebar: network nodes -->
+  <div class="sidebar">
+    <div class="sidebar-header">
+      Network Nodes <span id="node-count" style="color:#536471">(0)</span>
+    </div>
+    <div class="node-list" id="node-list"></div>
+    <div class="identity-bar">
+      <div><span class="label">Your ID: </span><span class="value" id="my-id">-</span></div>
+      <button onclick="announceMe()">Announce Me</button>
+    </div>
+  </div>
+
+  <!-- Chat area -->
+  <div class="chat-area" id="chat-area">
+    <div class="empty-state" id="empty-state">
+      <div>
+        <div style="font-size: 1.5em; margin-bottom: 8px;">No conversation selected</div>
+        <div>Connect to the bridge and click a node to start chatting</div>
+        <div style="margin-top: 12px; font-size: 0.85em;">
+          Start the server: <code>python examples/chat-server.py</code>
+        </div>
+      </div>
+    </div>
+    <div id="chat-active" style="display:none; flex:1; display:flex; flex-direction:column;">
+      <div class="chat-header">
+        <strong id="chat-target-name">-</strong>
+        <span class="target" id="chat-target-hash">-</span>
+        <span class="link-status none" id="link-status">No link</span>
+      </div>
+      <div class="messages" id="messages"></div>
+      <div class="input-bar">
+        <input type="text" id="msg-input" placeholder="Type a message..." onkeydown="if(event.key==='Enter')sendMessage()" />
+        <button id="btn-send" onclick="sendMessage()" disabled>&#x27A4;</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="../dist/reticulum.umd.js"></script>
+<script>
+const R = window.Reticulum;
+
+// --- State ---
+let transport = null;
+let wsInterface = null;
+let identity = null;
+let myDest = null;
+let connected = false;
+
+// nodes: Map<destHex, { identity, appData, hops, time, destHash }>
+const nodes = new Map();
+// conversations: Map<destHex, { link, messages[], linkStatus }>
+const conversations = new Map();
+let activeConvo = null; // destHex of currently selected
+
+// --- Connection ---
+async function toggleConnection() {
+  if (connected) { await disconnect(); return; }
+
+  const url = document.getElementById('ws-url').value;
+  transport = new R.Transport();
+  wsInterface = new R.WebSocketClientInterface('Browser', url);
+  transport.registerInterface(wsInterface);
+
+  transport.on('announce', onAnnounce);
+
+  try {
+    await wsInterface.start();
+    connected = true;
+    updateConnUI();
+    startConnWatch();
+    if (!identity) createIdentity();
+    addSystemMsg(null, 'Connected to bridge');
+  } catch(e) {
+    addSystemMsg(null, 'Connection failed: ' + e.message);
+  }
+}
+
+async function disconnect() {
+  stopConnWatch();
+  // Close all links
+  for (const [, c] of conversations) {
+    if (c.link) try { await c.link.close(); } catch {}
+  }
+  conversations.clear();
+  if (wsInterface) await wsInterface.stop();
+  transport = null; wsInterface = null;
+  connected = false;
+  updateConnUI();
+}
+
+let connWatchTimer = null;
+function startConnWatch() {
+  stopConnWatch();
+  connWatchTimer = setInterval(() => {
+    if (!wsInterface) return;
+    const isOnline = wsInterface.online;
+    if (connected && !isOnline) {
+      connected = false;
+      updateConnUI('reconnecting');
+      addSystemMsg(null, 'Connection lost — reconnecting...');
+    } else if (!connected && isOnline) {
+      connected = true;
+      updateConnUI();
+      addSystemMsg(null, 'Reconnected to bridge');
+    }
+  }, 1000);
+}
+function stopConnWatch() {
+  if (connWatchTimer) { clearInterval(connWatchTimer); connWatchTimer = null; }
+}
+
+function updateConnUI(state) {
+  const dot = document.getElementById('conn-dot');
+  const btn = document.getElementById('btn-conn');
+  if (state === 'reconnecting') {
+    dot.className = 'dot reconnecting';
+    btn.textContent = 'Disconnect';
+    btn.className = 'btn-disconnect';
+  } else if (connected) {
+    dot.className = 'dot on';
+    btn.textContent = 'Disconnect';
+    btn.className = 'btn-disconnect';
+  } else {
+    dot.className = 'dot off';
+    btn.textContent = 'Connect';
+    btn.className = 'btn-connect';
+  }
+}
+
+// --- Identity ---
+function createIdentity() {
+  identity = R.Identity.generate();
+  myDest = new R.Destination(identity, R.DEST_IN, R.DEST_SINGLE, 'rns_chat', 'browser');
+  document.getElementById('my-id').textContent = identity.hexHash.slice(0, 16) + '..';
+  document.getElementById('my-id').title = identity.hexHash;
+}
+
+function announceMe() {
+  if (!transport || !myDest) return;
+  const pkt = R.createAnnounce(myDest, new TextEncoder().encode('Browser Chat'));
+  transport.transmit(pkt);
+  addSystemMsg(null, 'Announced to network');
+}
+
+// --- Announces ---
+function onAnnounce(info) {
+  const hex = R.toHex(info.destinationHash);
+  let appStr = '';
+  if (info.appData) {
+    try { appStr = new TextDecoder().decode(info.appData); } catch {}
+  }
+  nodes.set(hex, {
+    identity: info.identity,
+    appData: appStr,
+    hops: info.hops,
+    time: new Date(),
+    destHash: info.destinationHash,
+  });
+  renderNodeList();
+}
+
+function renderNodeList() {
+  const el = document.getElementById('node-list');
+  document.getElementById('node-count').textContent = '(' + nodes.size + ')';
+
+  el.innerHTML = '';
+  for (const [hex, node] of nodes) {
+    const div = document.createElement('div');
+    div.className = 'node-item' + (activeConvo === hex ? ' active' : '');
+    div.onclick = () => selectNode(hex);
+
+    const convo = conversations.get(hex);
+    const unread = convo ? convo.messages.filter(m => !m.read && m.dir === 'in').length : 0;
+
+    div.innerHTML = `
+      <div class="app">${esc(node.appData || 'Unknown Node')}${unread ? ' <span style="color:#1d9bf0">(' + unread + ')</span>' : ''}</div>
+      <div class="hash">${hex.slice(0, 24)}..</div>
+      <div class="meta">${node.hops} hop${node.hops !== 1 ? 's' : ''} &middot; ${timeAgo(node.time)}</div>
+    `;
+    el.appendChild(div);
+  }
+}
+
+// --- Conversations ---
+function selectNode(hex) {
+  activeConvo = hex;
+  renderNodeList();
+  showChat(hex);
+
+  const convo = getConvo(hex);
+  // Mark messages as read
+  convo.messages.forEach(m => m.read = true);
+
+  // If no link, try to establish one
+  if (!convo.link || convo.linkStatus === 'closed') {
+    establishLink(hex);
+  }
+}
+
+function getConvo(hex) {
+  if (!conversations.has(hex)) {
+    conversations.set(hex, { link: null, messages: [], linkStatus: 'none' });
+  }
+  return conversations.get(hex);
+}
+
+function showChat(hex) {
+  document.getElementById('empty-state').style.display = 'none';
+  const active = document.getElementById('chat-active');
+  active.style.display = 'flex';
+
+  const node = nodes.get(hex);
+  document.getElementById('chat-target-name').textContent = node?.appData || 'Unknown';
+  document.getElementById('chat-target-hash').textContent = hex.slice(0, 20) + '..';
+
+  renderMessages(hex);
+  updateLinkUI(hex);
+}
+
+function renderMessages(hex) {
+  const el = document.getElementById('messages');
+  const convo = getConvo(hex);
+  el.innerHTML = '';
+
+  for (const msg of convo.messages) {
+    const div = document.createElement('div');
+    if (msg.type === 'system') {
+      div.className = 'msg system';
+      div.textContent = msg.text;
+    } else {
+      div.className = 'msg ' + (msg.dir === 'out' ? 'sent' : 'received');
+      div.innerHTML = `
+        ${msg.sender ? '<div class="sender">' + esc(msg.sender) + '</div>' : ''}
+        <div>${esc(msg.text)}</div>
+        <div class="time">${new Date(msg.time).toLocaleTimeString()}</div>
+      `;
+    }
+    el.appendChild(div);
+  }
+  el.scrollTop = el.scrollHeight;
+}
+
+function updateLinkUI(hex) {
+  const convo = getConvo(hex);
+  const el = document.getElementById('link-status');
+  const sendBtn = document.getElementById('btn-send');
+
+  switch (convo.linkStatus) {
+    case 'active':
+      el.textContent = 'Encrypted link';
+      el.className = 'link-status active';
+      sendBtn.disabled = false;
+      break;
+    case 'pending':
+      el.textContent = 'Establishing link...';
+      el.className = 'link-status pending';
+      sendBtn.disabled = true;
+      break;
+    default:
+      el.textContent = 'No link';
+      el.className = 'link-status none';
+      sendBtn.disabled = true;
+  }
+}
+
+function addMsg(hex, msg) {
+  const convo = getConvo(hex);
+  convo.messages.push(msg);
+  if (activeConvo === hex) {
+    renderMessages(hex);
+  }
+  renderNodeList(); // update unread count
+}
+
+function addSystemMsg(hex, text) {
+  if (hex) {
+    addMsg(hex, { type: 'system', text, time: Date.now(), read: true });
+  }
+}
+
+// --- Links ---
+async function establishLink(hex) {
+  const node = nodes.get(hex);
+  if (!node || !transport) return;
+
+  const convo = getConvo(hex);
+  convo.linkStatus = 'pending';
+  updateLinkUI(hex);
+  addSystemMsg(hex, 'Establishing encrypted link...');
+
+  // Create a destination for the remote node
+  const remoteDest = new R.Destination(
+    node.identity, R.DEST_IN, R.DEST_SINGLE,
+    'rns_chat', 'bot' // match the chat server's app name
+  );
+
+  const link = R.Link.init(remoteDest, transport);
+  transport.registerPendingLink(link);
+  convo.link = link;
+
+  link.on('established', () => {
+    convo.linkStatus = 'active';
+    addSystemMsg(hex, 'Encrypted link established!');
+    if (activeConvo === hex) updateLinkUI(hex);
+  });
+
+  link.on('closed', () => {
+    convo.linkStatus = 'closed';
+    convo.link = null;
+    addSystemMsg(hex, 'Link closed');
+    if (activeConvo === hex) updateLinkUI(hex);
+  });
+
+  // Handle incoming data on the link
+  link.on('data', (plaintext) => {
+    try {
+      const msg = JSON.parse(new TextDecoder().decode(plaintext));
+      addMsg(hex, {
+        type: msg.type || 'message',
+        sender: msg.sender || 'Remote',
+        text: msg.text || '',
+        time: (msg.time || Date.now() / 1000) * 1000,
+        dir: 'in',
+        read: activeConvo === hex,
+      });
+    } catch {
+      addMsg(hex, {
+        type: 'message',
+        sender: 'Remote',
+        text: new TextDecoder().decode(plaintext),
+        time: Date.now(),
+        dir: 'in',
+        read: activeConvo === hex,
+      });
+    }
+  });
+}
+
+async function sendMessage() {
+  if (!activeConvo) return;
+  const input = document.getElementById('msg-input');
+  const text = input.value.trim();
+  if (!text) return;
+
+  const convo = getConvo(activeConvo);
+  if (!convo.link || convo.linkStatus !== 'active') return;
+
+  const msg = {
+    type: 'message',
+    sender: identity.hexHash.slice(0, 8),
+    text: text,
+    time: Date.now() / 1000,
+  };
+
+  try {
+    const encoded = new TextEncoder().encode(JSON.stringify(msg));
+    await convo.link.send(encoded);
+
+    addMsg(activeConvo, {
+      type: 'message',
+      sender: 'You',
+      text: text,
+      time: Date.now(),
+      dir: 'out',
+      read: true,
+    });
+
+    input.value = '';
+  } catch(e) {
+    addSystemMsg(activeConvo, 'Send failed: ' + e.message);
+  }
+}
+
+// --- Utils ---
+function esc(s) { return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function timeAgo(d) {
+  const s = Math.floor((Date.now() - d.getTime()) / 1000);
+  if (s < 60) return s + 's ago';
+  if (s < 3600) return Math.floor(s/60) + 'm ago';
+  return Math.floor(s/3600) + 'h ago';
+}
+
+// Refresh times periodically
+setInterval(renderNodeList, 10000);
+</script>
+</body>
+</html>

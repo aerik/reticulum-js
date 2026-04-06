@@ -1,0 +1,128 @@
+{
+  "generated_by": "Python RNS 1.1.4",
+  "generated_at": 1775059331,
+  "identity": {
+    "public_key_hex": "5234eefb88eff4e45111412f79f08731f6e781027a20d5b22f607e2f9e809d0a975aa49dca18431220bd9255ef744b6f7be93210c9ca2713b8ba0ffd337c6fc1",
+    "private_key_hex": "b80149364e22fac1e592c4f81331f89c4b69266cf93d7141744176a655c65f77abedf5957dcd8c7349ce1a8baf80a2b3d3f70f25497d7597d42f89c4b3cf2a9f",
+    "hash_hex": "4c7f33498293a630bf80589dd90f561e",
+    "hexhash": "4c7f33498293a630bf80589dd90f561e",
+    "public_key_length": 64,
+    "private_key_length": 64,
+    "hash_length": 16
+  },
+  "destinations": {
+    "identity_public_key_hex": "4cd0f89d937ef9309bd9073c003544c6a9d52d656f69f086ba0510fdcf555c6e20e8ab92bd3529ed2609999e9622cac52d715049680fb7ac889a4180ed055ac3",
+    "identity_private_key_hex": "20bf004a6e47313b2084854ac909c1ba90672e32e34d0728afb1b89dd1e4a06566104c03be96515ff11c155c32b771bb265cb13335381761fd3e75539315c852",
+    "identity_hash_hex": "57b60bec377a86e6b2197267e61d78a5",
+    "cases": [
+      {
+        "app_name": "test_app",
+        "aspects": [
+          "service"
+        ],
+        "full_name": "test_app.service.57b60bec377a86e6b2197267e61d78a5",
+        "identity_public_key_hex": "4cd0f89d937ef9309bd9073c003544c6a9d52d656f69f086ba0510fdcf555c6e20e8ab92bd3529ed2609999e9622cac52d715049680fb7ac889a4180ed055ac3",
+        "identity_hash_hex": "57b60bec377a86e6b2197267e61d78a5",
+        "name_hash_hex": "cf52679f95a64da42ec6",
+        "name_hash_length": 10,
+        "destination_hash_hex": "4c88e6384fca5cff1939e1bd617ed8af",
+        "destination_hash_length": 16
+      },
+      {
+        "app_name": "myapp",
+        "aspects": [],
+        "full_name": "myapp.57b60bec377a86e6b2197267e61d78a5",
+        "identity_public_key_hex": "4cd0f89d937ef9309bd9073c003544c6a9d52d656f69f086ba0510fdcf555c6e20e8ab92bd3529ed2609999e9622cac52d715049680fb7ac889a4180ed055ac3",
+        "identity_hash_hex": "57b60bec377a86e6b2197267e61d78a5",
+        "name_hash_hex": "c1b70247946b22975617",
+        "name_hash_length": 10,
+        "destination_hash_hex": "d7e8cc06a152f6ea2d0ed2ce943b7653",
+        "destination_hash_length": 16
+      },
+      {
+        "app_name": "lxmf",
+        "aspects": [
+          "delivery"
+        ],
+        "full_name": "lxmf.delivery.57b60bec377a86e6b2197267e61d78a5",
+        "identity_public_key_hex": "4cd0f89d937ef9309bd9073c003544c6a9d52d656f69f086ba0510fdcf555c6e20e8ab92bd3529ed2609999e9622cac52d715049680fb7ac889a4180ed055ac3",
+        "identity_hash_hex": "57b60bec377a86e6b2197267e61d78a5",
+        "name_hash_hex": "6ec60bc318e2c0f0d908",
+        "name_hash_length": 10,
+        "destination_hash_hex": "53a8d69ec7e004dd5e10087fddf2f0e1",
+        "destination_hash_length": 16
+      },
+      {
+        "app_name": "nomadnetwork",
+        "aspects": [
+          "node"
+        ],
+        "full_name": "nomadnetwork.node.57b60bec377a86e6b2197267e61d78a5",
+        "identity_public_key_hex": "4cd0f89d937ef9309bd9073c003544c6a9d52d656f69f086ba0510fdcf555c6e20e8ab92bd3529ed2609999e9622cac52d715049680fb7ac889a4180ed055ac3",
+        "identity_hash_hex": "57b60bec377a86e6b2197267e61d78a5",
+        "name_hash_hex": "213e6311bcec54ab4fde",
+        "name_hash_length": 10,
+        "destination_hash_hex": "ef0819210046b0d3d9a358cd0f052bb5",
+        "destination_hash_length": 16
+      },
+      {
+        "app_name": "app",
+        "aspects": [
+          "a",
+          "b",
+          "c"
+        ],
+        "full_name": "app.a.b.c.57b60bec377a86e6b2197267e61d78a5",
+        "identity_public_key_hex": "4cd0f89d937ef9309bd9073c003544c6a9d52d656f69f086ba0510fdcf555c6e20e8ab92bd3529ed2609999e9622cac52d715049680fb7ac889a4180ed055ac3",
+        "identity_hash_hex": "57b60bec377a86e6b2197267e61d78a5",
+        "name_hash_hex": "fde6d404e6dd7e9a0168",
+        "name_hash_length": 10,
+        "destination_hash_hex": "4c4b2041ad82e6a0e6ee276280e7270d",
+        "destination_hash_length": 16
+      },
+      {
+        "app_name": "broadcast",
+        "aspects": [
+          "channel"
+        ],
+        "type": "PLAIN",
+        "full_name": "broadcast.channel",
+        "identity_public_key_hex": null,
+        "identity_hash_hex": null,
+        "name_hash_hex": "b64b2ab850860e3315f5",
+        "name_hash_length": 10,
+        "destination_hash_hex": "066951e758a2aa0068dd10ec3ee8bfbc",
+        "destination_hash_length": 16
+      }
+    ]
+  },
+  "announce": {
+    "app_name": "test_app",
+    "aspects": [
+      "announce_test"
+    ],
+    "name_for_hash": "test_app.announce_test",
+    "identity_public_key_hex": "387d4f087acf49b319ba3e5ff07d3ab3e3a279be6d568c7ba7edaef7aee84c29ba88ee77946ee5574dad448dd5c2e5c88595f57e4b5c17f40b568dfa15cf64c4",
+    "identity_private_key_hex": "e887af5fafe57bcfbb1df96a1d6c8af5716f37ffefdb96cd675cfa91d080f248130107a2f02ecafc0f2cab2948d7ceafc2e7faf9942a7c6c292bbe6797fc596e",
+    "identity_hash_hex": "8fe9eed6968bacd6da6afb55ffab0567",
+    "name_hash_hex": "6a4ac2427da04d9df69c",
+    "destination_hash_hex": "84d4ea6d09ec75c4c1b7e3e0a0dc381c",
+    "hash_computation_verified": true
+  },
+  "encryption": {
+    "recipient_public_key_hex": "8704bb12bc4ebaa1bf1ef320b6ff9ee71c582ea0261f56fa0e36d0b5ffefc65eb0e5dc9a9bef16e3cbfd412b571031bf0445b2825e2376debb609474a2a4fb4d",
+    "recipient_private_key_hex": "582c9746428d8e46d309e08ae97f2dd89b3c0e9cc4b1c4dafe671928b8bf356e550bd152e60e88063aee996c67aebee9f91b461beb7d8f8f00a4b307602e0477",
+    "recipient_hash_hex": "bdf141b535ff7ed76301b5d1fec4cc86",
+    "plaintext_hex": "48656c6c6f2066726f6d20507974686f6e20524e5321",
+    "ciphertext_hex": "311e328998c63e45b04c4a9c13edbb607827511fd870872847d8c89bb9e9e55cd2a5eadf8d54d894a6eee27f53da4f1d3dfdda513c61d86b18430b6c8fe384a32015535b5bdba2fb6f31b91c90004117ffe0e71409e59bc0576fbe4ad693f78fb1f3382393d536f4f809de56339d12b0",
+    "ciphertext_length": 112,
+    "note": "Node.js should be able to decrypt this ciphertext using the recipient private key"
+  },
+  "signing": {
+    "public_key_hex": "1cc63e662d11ba8ac6db7b3ffa2be32130bf0000f26dfeb60123f23287bc844e08e06db534af4d4fc4fe175c9b7f7a7f187cbfb1d8df09ec1f6639c5369f1665",
+    "private_key_hex": "60a4b96a79742e01fbca71da418f6d00feedae6f43e3ed74606b782ccbc0c04436bf95f652c1c587bed44288322e4eb074eb7ce30d3fbe029f17ba4d02af41da",
+    "message_hex": "5265746963756c756d2074657374206d65737361676520666f72207369676e696e67",
+    "signature_hex": "2ad7eaf0c01330716076326fec3995a3b22665ca7294486d230514af48a92f84c7600888f4825aa3c6325f50b8bc5962bf199e22baa102797c49938ef9899e09",
+    "signature_length": 64
+  }
+}

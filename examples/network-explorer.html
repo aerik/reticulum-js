@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RNS Network Explorer</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: #0f1419; color: #e7e9ea; height: 100vh;
+    display: flex; flex-direction: column;
+  }
+
+  .header {
+    background: #16202a; border-bottom: 1px solid #2f3336;
+    padding: 8px 16px; display: flex; align-items: center; gap: 12px;
+  }
+  .header h1 { font-size: 1em; color: #1d9bf0; }
+  .conn { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+  .conn input { background: #202327; border: 1px solid #333639; color: #e7e9ea; padding: 4px 8px; border-radius: 4px; font-size: 0.85em; width: 170px; }
+  .conn button { padding: 4px 12px; border-radius: 14px; border: none; cursor: pointer; font-size: 0.85em; font-weight: 600; }
+  .btn-go { background: #1d9bf0; color: white; }
+  .btn-stop { background: #67070f; color: #f4212e; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .dot.on { background: #00ba7c; } .dot.off { background: #f4212e; }
+  .dot.reconnecting { background: #ffd400; animation: pulse 1s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+  .stats-bar {
+    background: #16202a; border-bottom: 1px solid #2f3336;
+    padding: 6px 16px; display: flex; gap: 20px; font-size: 0.8em; color: #8b98a5;
+  }
+  .stats-bar strong { color: #e7e9ea; }
+
+  .main { display: flex; flex: 1; overflow: hidden; }
+
+  /* Left: node list */
+  .sidebar {
+    width: 320px; border-right: 1px solid #2f3336; display: flex; flex-direction: column;
+  }
+  .filter-bar {
+    padding: 6px 10px; border-bottom: 1px solid #2f3336;
+    display: flex; gap: 4px; flex-wrap: wrap;
+  }
+  .filter-btn {
+    padding: 2px 8px; border-radius: 10px; font-size: 0.75em; cursor: pointer;
+    border: 1px solid #333639; background: transparent; color: #8b98a5;
+  }
+  .filter-btn.active { background: #1d3a50; color: #1d9bf0; border-color: #1d4668; }
+  .node-list { flex: 1; overflow-y: auto; }
+  .node {
+    padding: 8px 12px; border-bottom: 1px solid #1a1f26; cursor: pointer;
+    transition: background 0.1s;
+  }
+  .node:hover { background: #1c2732; }
+  .node.selected { background: #1d2f3f; border-left: 3px solid #1d9bf0; }
+  .node .name { font-size: 0.9em; color: #e7e9ea; }
+  .node .category {
+    display: inline-block; padding: 1px 6px; border-radius: 8px;
+    font-size: 0.7em; margin-left: 6px;
+  }
+  .cat-nomad { background: #1d3a50; color: #1d9bf0; }
+  .cat-lxmf { background: #2d1f3f; color: #c77dff; }
+  .cat-bbs { background: #1f3a2d; color: #7de87d; }
+  .cat-other { background: #2f2f20; color: #b0a060; }
+  .node .hash { font-family: monospace; font-size: 0.75em; color: #536471; }
+  .node .meta { font-size: 0.7em; color: #536471; margin-top: 2px; }
+
+  /* Right: detail panel */
+  .detail { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+  .detail-header {
+    padding: 12px 16px; border-bottom: 1px solid #2f3336; background: #16202a;
+  }
+  .detail-header h2 { font-size: 1em; }
+  .detail-header .dhash { font-family: monospace; color: #536471; font-size: 0.8em; margin-top: 2px; }
+  .detail-body { flex: 1; overflow-y: auto; padding: 16px; }
+
+  .info-grid { display: grid; grid-template-columns: 120px 1fr; gap: 4px 12px; font-size: 0.85em; margin-bottom: 16px; }
+  .info-grid .label { color: #536471; }
+  .info-grid .val { color: #e7e9ea; font-family: monospace; word-break: break-all; }
+
+  .action-bar { display: flex; gap: 8px; margin-bottom: 16px; }
+  .action-bar button {
+    padding: 6px 14px; border-radius: 14px; border: 1px solid #333639;
+    background: #1a1f26; color: #1d9bf0; cursor: pointer; font-size: 0.85em;
+  }
+  .action-bar button:hover { background: #1d3a50; }
+  .action-bar button:disabled { opacity: 0.4; cursor: default; }
+
+  /* Page viewer */
+  .page-viewer {
+    background: #0a0e14; border: 1px solid #2f3336; border-radius: 6px;
+    padding: 16px; font-family: 'Courier New', monospace; font-size: 0.85em;
+    line-height: 1.5; white-space: pre-wrap; min-height: 200px; color: #b3b1ad;
+  }
+  .page-viewer .heading { color: #e6b450; font-weight: bold; }
+  .page-viewer .link { color: #59c2ff; text-decoration: underline; cursor: pointer; }
+  .page-viewer .bold { font-weight: bold; color: #e7e9ea; }
+
+  .status-msg { font-size: 0.85em; color: #8b98a5; padding: 8px 0; }
+  .status-msg.error { color: #f4212e; }
+
+  .empty-detail {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    color: #536471; text-align: center;
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>RNS Network Explorer</h1>
+  <div class="conn">
+    <span class="dot off" id="dot"></span>
+    <input id="url" value="ws://localhost:8765" />
+    <button class="btn-go" id="btn" onclick="toggle()">Connect</button>
+  </div>
+</div>
+<div class="stats-bar">
+  <span>Packets: <strong id="s-pkt">0</strong></span>
+  <span>Announces: <strong id="s-ann">0</strong></span>
+  <span>Nodes: <strong id="s-nodes">0</strong></span>
+  <span>Identities: <strong id="s-ids">0</strong></span>
+  <span>Avg hops: <strong id="s-hops">-</strong></span>
+</div>
+
+<div class="main">
+  <div class="sidebar">
+    <div class="filter-bar">
+      <button class="filter-btn active" data-cat="all" onclick="setFilter('all',this)">All</button>
+      <button class="filter-btn" data-cat="nomad" onclick="setFilter('nomad',this)">NomadNet</button>
+      <button class="filter-btn" data-cat="lxmf" onclick="setFilter('lxmf',this)">LXMF</button>
+      <button class="filter-btn" data-cat="bbs" onclick="setFilter('bbs',this)">BBS</button>
+      <button class="filter-btn" data-cat="other" onclick="setFilter('other',this)">Other</button>
+    </div>
+    <div class="node-list" id="node-list"></div>
+  </div>
+
+  <div class="detail" id="detail">
+    <div class="empty-detail" id="empty-detail">
+      <div>
+        <div style="font-size:1.3em;margin-bottom:8px">Select a node to view details</div>
+        <div style="font-size:0.9em">Start: <code>python examples/chat-server.py</code></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="../dist/reticulum.umd.js"></script>
+<script>
+const R = window.Reticulum;
+let transport = null, wsIface = null, identity = null, connected = false;
+let filter = 'all', selected = null;
+
+// nodes: Map<hex, {identity, appData, hops, time, destHash, category, name}>
+const nodes = new Map();
+const identities = new Set();
+let totalHops = 0, announceCount = 0, pktCount = 0;
+
+// --- Connection ---
+let connWatchTimer = null;
+
+async function toggle() {
+  if (connected) { await disconnect(); return; }
+  transport = new R.Transport();
+  wsIface = new R.WebSocketClientInterface('Explorer', document.getElementById('url').value);
+  transport.registerInterface(wsIface);
+  wsIface.on('packet', () => { pktCount++; updateStats(); });
+  transport.on('announce', onAnnounce);
+  try {
+    await wsIface.start();
+    connected = true;
+    identity = R.Identity.generate();
+    updateConn();
+    startConnWatch();
+  } catch(e) { alert('Connection failed: ' + e.message); }
+}
+async function disconnect() {
+  stopConnWatch();
+  if (wsIface) await wsIface.stop();
+  transport = null; wsIface = null; connected = false;
+  updateConn();
+}
+
+function startConnWatch() {
+  stopConnWatch();
+  connWatchTimer = setInterval(() => {
+    if (!wsIface) return;
+    const isOnline = wsIface.online;
+    if (connected && !isOnline) {
+      connected = false;
+      updateConn('reconnecting');
+    } else if (!connected && isOnline) {
+      connected = true;
+      updateConn();
+    }
+  }, 1000);
+}
+function stopConnWatch() {
+  if (connWatchTimer) { clearInterval(connWatchTimer); connWatchTimer = null; }
+}
+
+function updateConn(state) {
+  const dot = document.getElementById('dot');
+  const b = document.getElementById('btn');
+  if (state === 'reconnecting') {
+    dot.className = 'dot reconnecting';
+    b.textContent = 'Disconnect';
+    b.className = 'btn-stop';
+  } else if (connected) {
+    dot.className = 'dot on';
+    b.textContent = 'Disconnect';
+    b.className = 'btn-stop';
+  } else {
+    dot.className = 'dot off';
+    b.textContent = 'Connect';
+    b.className = 'btn-go';
+  }
+}
+
+// --- Categorize ---
+function categorize(appStr, destName) {
+  const lower = (appStr + ' ' + destName).toLowerCase();
+  if (lower.includes('nomad') || lower.includes('node')) return 'nomad';
+  if (lower.includes('lxmf') || lower.includes('delivery') || lower.includes('propagation')) return 'lxmf';
+  if (lower.includes('bbs') || lower.includes('bulletin')) return 'bbs';
+  return 'other';
+}
+
+// --- Announces ---
+function onAnnounce(info) {
+  announceCount++;
+  const hex = R.toHex(info.destinationHash);
+  let appStr = '';
+  if (info.appData) try { appStr = new TextDecoder().decode(info.appData); } catch {}
+
+  identities.add(info.identity.hexHash);
+  totalHops += info.hops;
+
+  const cat = categorize(appStr, '');
+  nodes.set(hex, {
+    identity: info.identity, appData: appStr, hops: info.hops,
+    time: new Date(), destHash: info.destinationHash, category: cat,
+    name: appStr || hex.slice(0, 16) + '..',
+  });
+  renderList();
+  updateStats();
+  if (selected === hex) showDetail(hex);
+}
+
+function updateStats() {
+  document.getElementById('s-pkt').textContent = pktCount;
+  document.getElementById('s-ann').textContent = announceCount;
+  document.getElementById('s-nodes').textContent = nodes.size;
+  document.getElementById('s-ids').textContent = identities.size;
+  document.getElementById('s-hops').textContent = announceCount > 0 ? (totalHops / announceCount).toFixed(1) : '-';
+}
+
+// --- Filter + List ---
+function setFilter(cat, btn) {
+  filter = cat;
+  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  renderList();
+}
+
+function renderList() {
+  const el = document.getElementById('node-list');
+  el.innerHTML = '';
+  const sorted = [...nodes.entries()].sort((a, b) => b[1].time - a[1].time);
+  for (const [hex, n] of sorted) {
+    if (filter !== 'all' && n.category !== filter) continue;
+    const div = document.createElement('div');
+    div.className = 'node' + (selected === hex ? ' selected' : '');
+    div.onclick = () => { selected = hex; renderList(); showDetail(hex); };
+    const catClass = 'cat-' + n.category;
+    div.innerHTML = `
+      <div class="name">${esc(n.name)}<span class="category ${catClass}">${n.category}</span></div>
+      <div class="hash">${hex}</div>
+      <div class="meta">${n.hops} hop${n.hops!==1?'s':''} &middot; id:${n.identity.hexHash.slice(0,12)}.. &middot; ${ago(n.time)}</div>
+    `;
+    el.appendChild(div);
+  }
+}
+
+// --- Detail Panel ---
+function showDetail(hex) {
+  const n = nodes.get(hex);
+  if (!n) return;
+  const el = document.getElementById('detail');
+  document.getElementById('empty-detail')?.remove();
+
+  el.innerHTML = `
+    <div class="detail-header">
+      <h2>${esc(n.name)}</h2>
+      <div class="dhash">${hex}</div>
+    </div>
+    <div class="detail-body">
+      <div class="info-grid">
+        <span class="label">Identity</span><span class="val">${n.identity.hexHash}</span>
+        <span class="label">Destination</span><span class="val">${hex}</span>
+        <span class="label">Hops</span><span class="val">${n.hops}</span>
+        <span class="label">Category</span><span class="val">${n.category}</span>
+        <span class="label">App Data</span><span class="val">${esc(n.appData) || '(none)'}</span>
+        <span class="label">Seen</span><span class="val">${n.time.toLocaleTimeString()}</span>
+        <span class="label">Public Key</span><span class="val" style="font-size:0.75em">${R.toHex(n.identity.publicKey)}</span>
+      </div>
+      <div class="action-bar">
+        <button onclick="tryFetchPage('${hex}')" id="fetch-btn-${hex}">Fetch Page (NomadNet)</button>
+        <button onclick="tryLink('${hex}')" id="link-btn-${hex}">Establish Link</button>
+      </div>
+      <div id="status-${hex}" class="status-msg"></div>
+      <div id="page-${hex}"></div>
+    </div>
+  `;
+}
+
+// --- Link + Page Fetch ---
+const activeLinks = new Map(); // hex → link
+
+// Try to figure out the app name by testing known patterns against the dest hash
+function guessDestination(identity, destHex) {
+  const knownApps = [
+    ['nomadnetwork', 'node'],
+    ['lxmf', 'delivery'],
+    ['lxmf', 'propagation'],
+    ['rns_chat', 'bot'],
+    ['rns_chat', 'browser'],
+    ['rns_bridge', 'websocket'],
+    ['sideband', 'presence'],
+    ['sideband', 'call'],
+  ];
+  for (const [app, ...aspects] of knownApps) {
+    const d = new R.Destination(identity, R.DEST_IN, R.DEST_SINGLE, app, ...aspects);
+    if (R.toHex(d.hash) === destHex) return d;
+  }
+  return null;
+}
+
+async function tryLink(hex) {
+  if (!transport || !connected) return;
+  const n = nodes.get(hex);
+  if (!n) return;
+  const statusEl = document.getElementById('status-' + hex);
+  const btn = document.getElementById('link-btn-' + hex);
+  btn.disabled = true;
+  statusEl.textContent = 'Establishing link...';
+  statusEl.className = 'status-msg';
+
+  try {
+    let remoteDest = guessDestination(n.identity, hex);
+    if (!remoteDest) {
+      // Ask user for app name
+      const appName = prompt(
+        'Could not auto-detect the app name for this destination.\n' +
+        'Enter the dotted app name (e.g. "nomadnetwork.node"):\n\n' +
+        'Destination: ' + hex,
+        'nomadnetwork.node'
+      );
+      if (!appName) { btn.disabled = false; return; }
+      const parts = appName.split('.');
+      remoteDest = new R.Destination(n.identity, R.DEST_IN, R.DEST_SINGLE, ...parts);
+      if (R.toHex(remoteDest.hash) !== hex) {
+        statusEl.textContent = `App name "${appName}" does not match destination hash. The computed hash ${R.toHex(remoteDest.hash).slice(0,16)}.. != ${hex.slice(0,16)}..`;
+        statusEl.className = 'status-msg error';
+        btn.disabled = false;
+        return;
+      }
+    }
+    statusEl.textContent = 'Establishing link to ' + remoteDest.name + '...';
+
+    const link = R.Link.init(remoteDest, transport);
+    transport.registerPendingLink(link);
+
+    // Longer timeout for multi-hop links — 6s per hop + 15s base
+    const hops = nodes.get(hex)?.hops || 5;
+    const linkTimeout = 15000 + (hops * 6000);
+    statusEl.textContent = `Establishing link to ${remoteDest.name} (${hops} hops, timeout: ${Math.round(linkTimeout/1000)}s)...`;
+
+    const ok = await new Promise(resolve => {
+      const t = setTimeout(() => resolve(false), linkTimeout);
+      link.on('established', () => { clearTimeout(t); resolve(true); });
+    });
+
+    if (ok) {
+      activeLinks.set(hex, link);
+      statusEl.textContent = 'Link established! Link ID: ' + R.toHex(link.linkId).slice(0, 16) + '..';
+      statusEl.className = 'status-msg';
+      btn.textContent = 'Linked';
+
+      link.on('closed', () => {
+        activeLinks.delete(hex);
+        statusEl.textContent = 'Link closed.';
+        btn.textContent = 'Establish Link';
+        btn.disabled = false;
+      });
+    } else {
+      statusEl.textContent = `Link timed out (${Math.round(linkTimeout/1000)}s). The remote node may be unreachable or the network path is too slow.`;
+      statusEl.className = 'status-msg error';
+      btn.disabled = false;
+    }
+  } catch(e) {
+    statusEl.textContent = 'Error: ' + e.message;
+    statusEl.className = 'status-msg error';
+    btn.disabled = false;
+  }
+}
+
+async function tryFetchPage(hex) {
+  if (!transport || !connected) return;
+  const statusEl = document.getElementById('status-' + hex);
+  const pageEl = document.getElementById('page-' + hex);
+  const btn = document.getElementById('fetch-btn-' + hex);
+  btn.disabled = true;
+
+  // Establish link first if needed
+  if (!activeLinks.has(hex)) {
+    await tryLink(hex);
+    if (!activeLinks.has(hex)) {
+      btn.disabled = false;
+      return;
+    }
+  }
+
+  statusEl.textContent = 'Requesting /page/index.mu (timeout: 90s)...';
+  const link = activeLinks.get(hex);
+
+  // Show progress while waiting
+  const progressTimer = setInterval(() => {
+    if (link._activeResource) {
+      const r = link._activeResource;
+      statusEl.textContent = `Receiving: ${r.receivedParts}/${r.totalParts} parts (${r.dataSize} bytes)...`;
+    }
+  }, 500);
+
+  try {
+    const resp = await link.request('/page/index.mu', null, 90000);
+    clearInterval(progressTimer);
+    if (resp) {
+      const text = new TextDecoder().decode(resp);
+      statusEl.textContent = 'Page received (' + resp.length + ' bytes)';
+      pageEl.innerHTML = '<div class="page-viewer">' + renderMicron(text) + '</div>';
+    } else {
+      let detail = '';
+      if (link._activeResource) {
+        const r = link._activeResource;
+        detail = ` (Resource: ${r.receivedParts}/${r.totalParts} parts, status=${r.status})`;
+      }
+      statusEl.textContent = 'No response after 90s.' + detail;
+      statusEl.className = 'status-msg error';
+    }
+  } catch(e) {
+    clearInterval(progressTimer);
+    statusEl.textContent = 'Request failed: ' + e.message;
+    statusEl.className = 'status-msg error';
+    console.error('Page fetch error:', e);
+  }
+  btn.disabled = false;
+}
+
+// --- Simple Micron Markup Renderer ---
+function renderMicron(text) {
+  // Strip header directives
+  const lines = text.split('\n');
+  const output = [];
+  for (const line of lines) {
+    if (line.startsWith('#!')) continue; // directive
+    // Headings
+    if (line.startsWith('>>')) {
+      output.push('<span class="heading">' + esc(line.replace(/^>+\s*/, '')) + '</span>');
+    } else if (line.startsWith('>')) {
+      output.push('<span class="heading">' + esc(line.replace(/^>+\s*/, '')) + '</span>');
+    }
+    // Links: `[text`]url`
+    else if (line.includes('`[')) {
+      const rendered = line.replace(/`\[([^\]]*)\]`([^`]*)`/g, '<span class="link">$1</span>');
+      output.push(esc(rendered).replace(/&lt;span class=&quot;link&quot;&gt;/g, '<span class="link">').replace(/&lt;\/span&gt;/g, '</span>'));
+    }
+    // Bold: *text*
+    else {
+      let l = esc(line);
+      l = l.replace(/\*([^*]+)\*/g, '<span class="bold">$1</span>');
+      output.push(l);
+    }
+  }
+  return output.join('\n');
+}
+
+// --- Utils ---
+function esc(s) { return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function ago(d) {
+  const s = Math.floor((Date.now() - d.getTime()) / 1000);
+  if (s < 60) return s + 's ago';
+  if (s < 3600) return Math.floor(s/60) + 'm ago';
+  return Math.floor(s/3600) + 'h ago';
+}
+setInterval(renderList, 15000);
+</script>
+</body>
+</html>
