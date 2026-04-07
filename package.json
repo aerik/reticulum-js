@@ -19,6 +19,7 @@
   },
   "browser": "./src/browser.js",
   "bin": {
+    "rnsd": "./bin/rnsd.js",
     "rnstatus": "./bin/rnstatus.js",
     "rnpath": "./bin/rnpath.js"
   },
@@ -28,6 +29,7 @@
     "test:interop": "vitest run --config vitest.interop.config.js",
     "serve": "node examples/serve.js",
     "build:browser": "vite build --config vite.browser.config.js",
+    "rnsd": "node bin/rnsd.js",
     "rnstatus": "node bin/rnstatus.js",
     "rnpath": "node bin/rnpath.js"
   },
