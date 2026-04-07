@@ -4,11 +4,14 @@
  * Matches the Python reference implementation (RNS/Resource.py) wire format.
  *
  * Transfer protocol:
- *   1. Sender advertises resource (RESOURCE_ADV) with size, parts, hashmap
- *   2. Receiver accepts (RESOURCE_REQ)
- *   3. Sender sends parts (RESOURCE) — each is an encrypted chunk
+ *   1. Sender advertises resource (RESOURCE_ADV) with size, parts, initial hashmap
+ *   2. Receiver accepts (RESOURCE_REQ) requesting a window of parts
+ *   3. Sender sends requested parts (RESOURCE)
  *   4. Receiver identifies parts via map_hash = SHA256(part_data + random_hash)[:4]
- *   5. After all parts received, receiver verifies hash and sends proof (RESOURCE_PRF)
+ *   5. When all requested parts arrive, receiver grows window and requests more
+ *   6. If hashmap is exhausted, receiver sets HASHMAP_IS_EXHAUSTED flag
+ *   7. Sender responds with a hashmap update (RESOURCE_HMU) for the next segment
+ *   8. After all parts received, receiver verifies hash and sends proof (RESOURCE_PRF)
  */
 
 import { encode as msgpackEncode, decode as msgpackDecode } from '@msgpack/msgpack';
@@ -23,16 +26,32 @@ import {
   CONTEXT_RESOURCE, CONTEXT_RESOURCE_ADV, CONTEXT_RESOURCE_REQ,
   CONTEXT_RESOURCE_HMU, CONTEXT_RESOURCE_PRF,
   CONTEXT_RESOURCE_ICL, CONTEXT_RESOURCE_RCL,
+  MTU,
 } from './constants.js';
 
 const TAG = 'Resource';
 
-// Constants
+// Constants (matching Python RNS/Resource.py)
 const MAPHASH_LEN = 4;
 const RANDOM_HASH_SIZE = 4;
 const ADV_OVERHEAD = 134;
 const HASHMAP_MAX_LEN = 74;
-const WINDOW_INITIAL = 4;
+
+// SDU derivation: link.mtu - HEADER_MAXSIZE - IFAC_MIN_SIZE
+// HEADER_MAXSIZE = 2 + 1 + 16*2 = 35, IFAC_MIN_SIZE = 1 → overhead = 36
+const SDU_OVERHEAD = 36;
+const DEFAULT_SDU = MTU - SDU_OVERHEAD;  // 464 with MTU=500
+
+// Window constants (matching Python Resource.py)
+const WINDOW_INITIAL     = 4;
+const WINDOW_MIN_INITIAL = 2;
+const WINDOW_MAX_SLOW    = 10;
+const WINDOW_MAX_FAST    = 75;
+const WINDOW_FLEXIBILITY = 4;
+
+// Hashmap exhaustion flags
+const HASHMAP_IS_NOT_EXHAUSTED = 0x00;
+const HASHMAP_IS_EXHAUSTED     = 0xFF;
 
 // Resource states
 export const RESOURCE_NONE        = 0x00;
@@ -61,6 +80,7 @@ function computeMapHash(partData, randomHash) {
 
 /**
  * Outgoing Resource — send large data over a link.
+ * Matches Python Resource.py sender side.
  */
 export class ResourceSender {
   /**
@@ -82,24 +102,25 @@ export class ResourceSender {
     this.hash = sha256Hash(concat(data, this.randomHash));
 
     // Prepare transfer data: random_hash prefix + data
-    // Then encrypt the entire stream via the link
     this.transferData = concat(this.randomHash, data);
 
-    // Compute SDU (segment data unit) from link MDU
-    // Link MDU depends on the link's negotiated MTU. Default ~431.
-    this.sdu = 431; // TODO: derive from link MTU
+    // Derive SDU from link MTU (matching Python: link.mtu - 36)
+    this.sdu = (link.mtu || MTU) - SDU_OVERHEAD;
 
     // Segment the transfer data
     this.totalParts = Math.ceil(this.transferData.length / this.sdu);
     this.parts = [];
     this.mapHashes = [];
+    this.hashmapRaw = new Uint8Array(this.totalParts * MAPHASH_LEN);
 
     for (let i = 0; i < this.totalParts; i++) {
       const start = i * this.sdu;
       const end = Math.min(start + this.sdu, this.transferData.length);
       const part = this.transferData.slice(start, end);
       this.parts.push(part);
-      this.mapHashes.push(computeMapHash(part, this.randomHash));
+      const mapHash = computeMapHash(part, this.randomHash);
+      this.mapHashes.push(mapHash);
+      this.hashmapRaw.set(mapHash, i * MAPHASH_LEN);
     }
 
     // Expected proof
@@ -117,12 +138,9 @@ export class ResourceSender {
   async advertise() {
     this.status = RESOURCE_ADVERTISING;
 
-    // Build hashmap bytes (first HASHMAP_MAX_LEN entries)
+    // Build initial hashmap (first HASHMAP_MAX_LEN entries, segment 0)
     const initialMapCount = Math.min(this.totalParts, HASHMAP_MAX_LEN);
-    const hashmap = new Uint8Array(initialMapCount * MAPHASH_LEN);
-    for (let i = 0; i < initialMapCount; i++) {
-      hashmap.set(this.mapHashes[i], i * MAPHASH_LEN);
-    }
+    const hashmap = this.hashmapRaw.slice(0, initialMapCount * MAPHASH_LEN);
 
     const flags = FLAG_ENCRYPTED; // always encrypted over links
 
@@ -148,26 +166,104 @@ export class ResourceSender {
 
   /**
    * Handle a resource request from the receiver.
+   * Matching Python Resource.request() — sends requested parts and HMU if needed.
    * @param {Uint8Array} plaintext
    */
   async handleRequest(plaintext) {
-    // Just start sending all parts
     this.status = RESOURCE_TRANSFERRING;
-    await this.sendParts();
+
+    // Parse the request
+    // Format: flag(1) [+ last_map_hash(4) if exhausted] + resource_hash(32) + requested_hashes(4*N)
+    let offset = 0;
+    const exhaustedFlag = plaintext[offset];
+    offset += 1;
+
+    let lastMapHash = null;
+    if (exhaustedFlag === HASHMAP_IS_EXHAUSTED) {
+      lastMapHash = plaintext.slice(offset, offset + MAPHASH_LEN);
+      offset += MAPHASH_LEN;
+    }
+
+    const resourceHash = plaintext.slice(offset, offset + 32);
+    offset += 32;
+
+    if (!equal(resourceHash, this.hash)) {
+      log(LOG_WARNING, TAG, 'Request hash mismatch');
+      return;
+    }
+
+    // Extract requested part hashes
+    const requestedHashes = [];
+    while (offset + MAPHASH_LEN <= plaintext.length) {
+      requestedHashes.push(plaintext.slice(offset, offset + MAPHASH_LEN));
+      offset += MAPHASH_LEN;
+    }
+
+    // Send requested parts
+    for (const reqHash of requestedHashes) {
+      // Find which part this hash corresponds to
+      for (let i = 0; i < this.mapHashes.length; i++) {
+        if (equal(this.mapHashes[i], reqHash)) {
+          await this.link.send(this.parts[i], CONTEXT_RESOURCE);
+          this.sentParts++;
+          this.progress = this.sentParts / this.totalParts;
+          if (this._onProgress) this._onProgress(this.progress);
+          break;
+        }
+      }
+    }
+
+    // If receiver needs more hashmap, send HMU
+    if (lastMapHash) {
+      this._sendHashmapUpdate(lastMapHash);
+    }
+
+    log(LOG_DEBUG, TAG, `Sent ${requestedHashes.length} requested parts (${this.sentParts}/${this.totalParts})`);
   }
 
   /**
-   * Send all parts sequentially.
+   * Send a hashmap update for the next segment.
+   * Matching Python Resource.py lines 1033-1044.
+   * @param {Uint8Array} lastMapHash - Last hash the receiver has
    */
-  async sendParts() {
-    for (let i = 0; i < this.totalParts; i++) {
-      await this.link.send(this.parts[i], CONTEXT_RESOURCE);
-      this.sentParts++;
-      this.progress = this.sentParts / this.totalParts;
-      if (this._onProgress) this._onProgress(this.progress);
+  async _sendHashmapUpdate(lastMapHash) {
+    // Find which part the last map hash belongs to
+    let partIndex = -1;
+    for (let i = 0; i < this.mapHashes.length; i++) {
+      if (equal(this.mapHashes[i], lastMapHash)) {
+        partIndex = i;
+        break;
+      }
     }
 
-    log(LOG_DEBUG, TAG, `Sent all ${this.totalParts} parts`);
+    if (partIndex < 0) {
+      log(LOG_WARNING, TAG, 'Could not find last map hash for HMU');
+      return;
+    }
+
+    // Calculate next segment
+    const segment = Math.floor((partIndex + 1) / HASHMAP_MAX_LEN);
+    const hashmapStart = segment * HASHMAP_MAX_LEN;
+    const hashmapEnd = Math.min(hashmapStart + HASHMAP_MAX_LEN, this.totalParts);
+
+    if (hashmapStart >= this.totalParts) {
+      log(LOG_DEBUG, TAG, 'No more hashmap segments to send');
+      return;
+    }
+
+    // Build hashmap bytes for this segment
+    const hashmap = this.hashmapRaw.slice(
+      hashmapStart * MAPHASH_LEN,
+      hashmapEnd * MAPHASH_LEN
+    );
+
+    // HMU format: resource_hash(32) + msgpack([segment, hashmap])
+    const hmuPayload = new Uint8Array(msgpackEncode([segment, hashmap]));
+    const hmu = concat(this.hash, hmuPayload);
+
+    await this.link.send(hmu, CONTEXT_RESOURCE_HMU);
+
+    log(LOG_DEBUG, TAG, `Sent HMU segment ${segment} (parts ${hashmapStart}-${hashmapEnd - 1})`);
   }
 
   /**
@@ -197,6 +293,7 @@ export class ResourceSender {
 
 /**
  * Incoming Resource — receive large data over a link.
+ * Matches Python Resource.py receiver side with windowed requesting and HMU support.
  */
 export class ResourceReceiver {
   /**
@@ -221,18 +318,27 @@ export class ResourceReceiver {
     this.requestId = adv.q ? new Uint8Array(adv.q) : null;
     this.flags = adv.f;
 
-    // Parse initial hashmap
+    // Hashmap: array of nullable 4-byte entries (matching Python self.hashmap list)
+    this.hashmap = new Array(this.totalParts).fill(null);
+    this.hashmapHeight = 0;
+
+    // Parse initial hashmap from advertisement (segment 0)
     const mapBytes = new Uint8Array(adv.m);
-    this.mapHashes = [];
-    for (let i = 0; i < mapBytes.length; i += MAPHASH_LEN) {
-      this.mapHashes.push(mapBytes.slice(i, i + MAPHASH_LEN));
-    }
+    this._applyHashmapUpdate(0, mapBytes);
 
     // Prepare parts array
     this.parts = new Array(this.totalParts).fill(null);
     this.receivedParts = 0;
+    this.consecutiveCompleted = 0;
+    this.outstandingParts = 0;
     this.progress = 0;
     this.data = null;
+
+    // Window (matching Python Resource.py)
+    this.window = WINDOW_INITIAL;
+    this.windowMin = WINDOW_MIN_INITIAL;
+    this.windowMax = WINDOW_MAX_SLOW;
+    this.waitingForHmu = false;
 
     this._onComplete = null;
     this._onProgress = null;
@@ -241,32 +347,126 @@ export class ResourceReceiver {
   }
 
   /**
-   * Accept the resource (send request to sender).
+   * Apply a hashmap update (segment 0 from adv, or later segments from HMU).
+   * Matching Python Resource.hashmap_update().
+   * @param {number} segment
+   * @param {Uint8Array} hashmapBytes
+   */
+  _applyHashmapUpdate(segment, hashmapBytes) {
+    const segLen = HASHMAP_MAX_LEN;
+    const hashes = Math.floor(hashmapBytes.length / MAPHASH_LEN);
+
+    for (let i = 0; i < hashes; i++) {
+      const idx = i + segment * segLen;
+      if (idx < this.totalParts) {
+        if (this.hashmap[idx] === null) {
+          this.hashmapHeight++;
+        }
+        this.hashmap[idx] = hashmapBytes.slice(i * MAPHASH_LEN, (i + 1) * MAPHASH_LEN);
+      }
+    }
+  }
+
+  /**
+   * Handle an incoming hashmap update packet.
+   * Matching Python Resource.hashmap_update_packet().
+   * @param {Uint8Array} plaintext - Decrypted HMU data
+   */
+  handleHashmapUpdate(plaintext) {
+    if (this.status === RESOURCE_FAILED) return;
+
+    // Format: resource_hash(32) + msgpack([segment, hashmap_bytes])
+    const update = msgpackDecode(plaintext.slice(32));
+    const segment = update[0];
+    const hashmapBytes = new Uint8Array(update[1]);
+
+    this._applyHashmapUpdate(segment, hashmapBytes);
+
+    log(LOG_DEBUG, TAG, `Applied HMU segment ${segment} (hashmap height: ${this.hashmapHeight}/${this.totalParts})`);
+
+    this.waitingForHmu = false;
+    this._requestNext();
+  }
+
+  /**
+   * Accept the resource and start requesting parts.
    */
   async accept() {
     this.status = RESOURCE_TRANSFERRING;
+    this._requestNext();
+  }
 
-    // Build RESOURCE_REQ: [flag(1)] + [resource_hash(32)] + [requested_map_hashes]
-    // The sender uses the map hashes to know which parts to send.
-    // Request all parts from our hashmap.
-    const requestedHashes = new Uint8Array(this.mapHashes.length * MAPHASH_LEN);
-    for (let i = 0; i < this.mapHashes.length; i++) {
-      requestedHashes.set(this.mapHashes[i], i * MAPHASH_LEN);
+  /**
+   * Request the next window of parts.
+   * Matching Python Resource.request_next().
+   */
+  async _requestNext() {
+    if (this.status === RESOURCE_FAILED) return;
+    if (this.waitingForHmu) return;
+
+    // Find consecutive completed height
+    this._updateConsecutiveCompleted();
+
+    const searchStart = this.consecutiveCompleted;
+    const searchSize = Math.min(this.window, this.totalParts - searchStart);
+    const requestedHashes = [];
+    let hashmapExhausted = HASHMAP_IS_NOT_EXHAUSTED;
+
+    for (let pn = searchStart; pn < searchStart + searchSize; pn++) {
+      if (this.parts[pn] === null) {
+        const partHash = this.hashmap[pn];
+        if (partHash !== null) {
+          requestedHashes.push(partHash);
+        } else {
+          // Hashmap exhausted — need more from sender
+          hashmapExhausted = HASHMAP_IS_EXHAUSTED;
+          break;
+        }
+      }
     }
 
-    const reqData = concat(
-      new Uint8Array([0x00]), // HASHMAP_IS_NOT_EXHAUSTED
-      this.hash,              // 32-byte resource hash
-      requestedHashes,        // 4 bytes per requested part
-    );
+    if (requestedHashes.length === 0 && hashmapExhausted === HASHMAP_IS_NOT_EXHAUSTED) {
+      // Nothing to request — might be done
+      return;
+    }
 
+    this.outstandingParts = requestedHashes.length;
+
+    // Build RESOURCE_REQ
+    // Format: flag(1) [+ last_map_hash(4)] + resource_hash(32) + requested_hashes(4*N)
+    let hmuPart;
+    if (hashmapExhausted === HASHMAP_IS_EXHAUSTED) {
+      const lastMapHash = this.hashmap[this.hashmapHeight - 1];
+      hmuPart = concat(new Uint8Array([HASHMAP_IS_EXHAUSTED]), lastMapHash);
+      this.waitingForHmu = true;
+    } else {
+      hmuPart = new Uint8Array([HASHMAP_IS_NOT_EXHAUSTED]);
+    }
+
+    const hashBytes = new Uint8Array(requestedHashes.length * MAPHASH_LEN);
+    for (let i = 0; i < requestedHashes.length; i++) {
+      hashBytes.set(requestedHashes[i], i * MAPHASH_LEN);
+    }
+
+    const reqData = concat(hmuPart, this.hash, hashBytes);
     await this.link.send(reqData, CONTEXT_RESOURCE_REQ);
 
-    log(LOG_DEBUG, TAG, `Accepted resource, requesting ${this.mapHashes.length} parts`);
+    log(LOG_DEBUG, TAG, `Requested ${requestedHashes.length} parts (window=${this.window}${hashmapExhausted ? ', hashmap exhausted' : ''})`);
+  }
+
+  /**
+   * Update consecutive completed counter.
+   */
+  _updateConsecutiveCompleted() {
+    while (this.consecutiveCompleted < this.totalParts &&
+           this.parts[this.consecutiveCompleted] !== null) {
+      this.consecutiveCompleted++;
+    }
   }
 
   /**
    * Handle an incoming resource part.
+   * Matching Python Resource.receive_part().
    * @param {Uint8Array} partData
    * @returns {boolean} true if all parts received
    */
@@ -275,23 +475,37 @@ export class ResourceReceiver {
     const mapHash = computeMapHash(partData, this.randomHash);
 
     // Find which part this is
-    for (let i = 0; i < this.mapHashes.length; i++) {
-      if (this.parts[i] === null && equal(this.mapHashes[i], mapHash)) {
+    for (let i = 0; i < this.hashmap.length; i++) {
+      if (this.parts[i] === null && this.hashmap[i] !== null && equal(this.hashmap[i], mapHash)) {
         this.parts[i] = partData;
         this.receivedParts++;
+        this.outstandingParts = Math.max(0, this.outstandingParts - 1);
         this.progress = this.receivedParts / this.totalParts;
         if (this._onProgress) this._onProgress(this.progress);
 
         log(LOG_DEBUG, TAG, `Received part ${i + 1}/${this.totalParts}`);
 
         if (this.receivedParts === this.totalParts) {
-          // _assemble is async when encrypted (needs Link.decrypt)
+          // All parts received — assemble
           const result = this._assemble();
           if (result instanceof Promise) {
             result.catch(err => log(LOG_WARNING, TAG, `Assembly failed: ${err.message}`));
           }
           return true;
         }
+
+        // If all outstanding parts arrived, grow window and request more
+        // (matching Python Resource.receive_part() window growth)
+        if (this.outstandingParts === 0) {
+          if (this.window < this.windowMax) {
+            this.window++;
+            if ((this.window - this.windowMin) > (WINDOW_FLEXIBILITY - 1)) {
+              this.windowMin++;
+            }
+          }
+          this._requestNext();
+        }
+
         return false;
       }
     }
@@ -302,7 +516,6 @@ export class ResourceReceiver {
 
   /**
    * Assemble all parts, decrypt if needed, verify, and extract data.
-   * @returns {boolean} true if assembly and verification succeed
    */
   _assemble() {
     // Concatenate all parts
@@ -314,10 +527,7 @@ export class ResourceReceiver {
       offset += part.length;
     }
 
-    let plainStream;
-
-    // If encrypted (FLAG_ENCRYPTED), the assembled data is a single Link-encrypted token.
-    // Decrypt using the Link's session keys, then verify.
+    // If encrypted, decrypt the assembled stream
     if ((this.flags & FLAG_ENCRYPTED) && this.link._encryptionKey) {
       return this.link.decrypt(assembled).then(
         (plainStream) => this._verifyAndComplete(plainStream),
@@ -337,7 +547,7 @@ export class ResourceReceiver {
     const randomHash = plainStream.slice(0, RANDOM_HASH_SIZE);
     let data = plainStream.slice(RANDOM_HASH_SIZE);
 
-    // If compressed, decompress. Python uses bz2.
+    // If compressed, decompress (Python uses bz2)
     if (this.flags & FLAG_COMPRESSED) {
       try {
         data = decompressBz2(data);
@@ -349,7 +559,7 @@ export class ResourceReceiver {
       }
     }
 
-    // Verify: SHA256(data + randomHash_from_advertisement) must equal resource hash
+    // Verify: SHA256(data + randomHash_from_adv) must equal resource hash
     const computed = sha256Hash(concat(data, this.randomHash));
     if (!equal(computed, this.hash)) {
       log(LOG_WARNING, TAG, 'Resource hash verification failed');

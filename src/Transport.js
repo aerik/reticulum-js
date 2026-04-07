@@ -32,7 +32,7 @@ import {
   CONTEXT_NONE,
   CONTEXT_KEEPALIVE, CONTEXT_LRPROOF, CONTEXT_LRRTT, CONTEXT_LINKCLOSE,
   CONTEXT_REQUEST, CONTEXT_RESPONSE, CONTEXT_CHANNEL,
-  CONTEXT_RESOURCE, CONTEXT_RESOURCE_ADV, CONTEXT_RESOURCE_REQ, CONTEXT_RESOURCE_PRF,
+  CONTEXT_RESOURCE, CONTEXT_RESOURCE_ADV, CONTEXT_RESOURCE_REQ, CONTEXT_RESOURCE_HMU, CONTEXT_RESOURCE_PRF,
   PATHFINDER_E, PATHFINDER_RW, PATHFINDER_R, PATHFINDER_G,
 } from './constants.js';
 import { Link } from './Link.js';
@@ -517,12 +517,15 @@ export class Transport extends EventEmitter {
         break;
       }
       case CONTEXT_RESOURCE_ADV:
-      case CONTEXT_RESOURCE_REQ: {
-        // RESOURCE_ADV and RESOURCE_REQ ARE encrypted per-packet
+      case CONTEXT_RESOURCE_REQ:
+      case CONTEXT_RESOURCE_HMU: {
+        // RESOURCE_ADV, RESOURCE_REQ, and RESOURCE_HMU are encrypted per-packet
         try {
           const plaintext = await link.decrypt(packet.data);
           if (packet.context === CONTEXT_RESOURCE_ADV) {
             link._handleResourceAdv(plaintext);
+          } else if (packet.context === CONTEXT_RESOURCE_HMU) {
+            link._handleResourceHmu(plaintext);
           } else {
             link.emit('resource_req', plaintext, packet);
           }

@@ -587,8 +587,11 @@ export class Link extends EventEmitter {
    * @param {Uint8Array} plaintext - Decrypted RESOURCE_HMU data
    */
   _handleResourceHmu(plaintext) {
-    // TODO: parse hashmap update and add to active resource
-    log(LOG_DEBUG, TAG, 'Resource HMU received (not yet handled)');
+    if (this._activeResource && this._activeResource.handleHashmapUpdate) {
+      this._activeResource.handleHashmapUpdate(plaintext);
+    } else {
+      log(LOG_WARNING, TAG, 'Resource HMU received but no active resource to handle it');
+    }
   }
 
   /**
