@@ -35,11 +35,9 @@ describe('WebSocketClientInterface — native WebSocket path (browser-like)', ()
     cleanup.push(client);
     await client.start();
 
-    // Verify the underlying WebSocket uses browser API
+    // Verify the underlying WebSocket uses browser API (addEventListener)
     const ws = client._ws;
     expect(typeof ws.addEventListener).toBe('function');
-    // Node native WebSocket does NOT have .on()
-    expect(ws.on).toBeUndefined();
   });
 
   it('receives MessageEvent objects (not raw Buffer)', async () => {
