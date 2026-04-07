@@ -100,6 +100,11 @@ export class Reticulum {
         this.transport.announceTable.set(k, v);
       }
 
+      const pathTable = await this.storage.loadPathTable();
+      for (const [k, v] of pathTable) {
+        this.transport.pathTable.set(k, v);
+      }
+
       const hashlist = await this.storage.loadHashlist();
       this.transport.packetHashlist = hashlist;
 
