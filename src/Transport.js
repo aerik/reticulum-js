@@ -33,7 +33,7 @@ import {
   CONTEXT_KEEPALIVE, CONTEXT_LRPROOF, CONTEXT_LRRTT, CONTEXT_LINKCLOSE,
   CONTEXT_REQUEST, CONTEXT_RESPONSE, CONTEXT_CHANNEL,
   CONTEXT_RESOURCE, CONTEXT_RESOURCE_ADV, CONTEXT_RESOURCE_REQ, CONTEXT_RESOURCE_PRF,
-  PATHFINDER_E,
+  PATHFINDER_E, PATHFINDER_RW, PATHFINDER_R, PATHFINDER_G,
 } from './constants.js';
 import { Link } from './Link.js';
 
@@ -41,6 +41,12 @@ const TAG = 'Transport';
 
 // Maximum entries in the packet hash list (for dedup)
 const HASHLIST_MAXSIZE = 1000000;
+
+// Table maintenance intervals (matching Python Transport.py)
+const TABLES_CULL_INTERVAL = 5;      // seconds — cull stale entries every 5s
+const ANNOUNCES_CHECK_INTERVAL = 1;  // seconds — process rebroadcast queue every 1s
+const REVERSE_TIMEOUT = 8 * 60;      // seconds — reverse table entry lifetime (8 min)
+const DESTINATION_TIMEOUT = 7 * 24 * 60 * 60; // seconds — announce table lifetime (7 days)
 
 export class Transport extends EventEmitter {
   /**
@@ -104,11 +110,23 @@ export class Transport extends EventEmitter {
      */
     this.pendingPathRequests = new Map();
 
+    /**
+     * Pending announce rebroadcasts: destHex → { retransmitAt, retries, packet, receivedOn }
+     * Matches Python Transport.announce_table rebroadcast scheduling.
+     * @type {Map<string, { retransmitAt: number, retries: number, packet: Packet,
+     *   receivedOn: import('./interfaces/Interface.js').Interface }>}
+     */
+    this.pendingAnnounces = new Map();
+
     /** Path request destination (well-known PLAIN) */
     this._pathRequestDest = null;
 
     /** Storage reference (set by Reticulum) */
     this.storage = null;
+
+    /** Table cleanup and announce rebroadcast timers */
+    this._announceCheckTimer = null;
+    this._tableCleanupTimer = null;
 
     /** Statistics */
     this.stats = {
@@ -354,29 +372,62 @@ export class Transport extends EventEmitter {
       interface: packet.receivingInterface,
     });
 
-    // If transport is enabled, schedule rebroadcast
+    // If transport is enabled, schedule rebroadcast with random delay
+    // (matching Python Transport.py PATHFINDER_RW logic)
     if (this.enableTransport && packet.hops < MAX_HOPS) {
-      this._rebroadcastAnnounce(packet);
+      this._scheduleAnnounceRebroadcast(packet);
     }
   }
 
   /**
-   * Rebroadcast an announce on all interfaces except the one it came from.
+   * Schedule an announce for delayed rebroadcast.
+   * Matches Python: initial delay = rand() * PATHFINDER_RW (0-0.5s),
+   * retry after PATHFINDER_G + PATHFINDER_RW (5.5s), max PATHFINDER_R retries.
    * @param {Packet} packet
    */
-  _rebroadcastAnnounce(packet) {
-    // Don't modify the original packet — create a copy
-    const rebroadcast = Packet.parse(packet.raw);
-    // Hops already incremented by inbound()
-    const raw = rebroadcast.pack();
+  _scheduleAnnounceRebroadcast(packet) {
+    const destHex = toHex(packet.destinationHash);
+    const now = Date.now() / 1000;
+    const retransmitAt = now + (Math.random() * PATHFINDER_RW);
 
-    for (const iface of this.interfaces) {
-      if (iface === packet.receivingInterface) continue;
-      if (!iface.online) continue;
-      iface.send(raw);
+    this.pendingAnnounces.set(destHex, {
+      retransmitAt,
+      retries: 0,
+      packet,
+      receivedOn: packet.receivingInterface,
+    });
+  }
+
+  /**
+   * Process pending announce rebroadcasts (called on interval).
+   * Matches Python Transport.py lines 518-577.
+   */
+  _processAnnounceRebroadcasts() {
+    const now = Date.now() / 1000;
+
+    for (const [destHex, entry] of this.pendingAnnounces) {
+      if (now >= entry.retransmitAt) {
+        if (entry.retries <= PATHFINDER_R) {
+          // Rebroadcast on all interfaces except the one it came from
+          const raw = entry.packet.raw;
+          for (const iface of this.interfaces) {
+            if (iface === entry.receivedOn) continue;
+            if (!iface.online) continue;
+            const toSend = iface.ifacConfig ? ifacMask(raw, iface.ifacConfig) : raw;
+            iface.send(toSend);
+          }
+
+          log(LOG_DEBUG, TAG, `Rebroadcast announce for ${destHex} (retry ${entry.retries})`);
+
+          // Schedule retry
+          entry.retries++;
+          entry.retransmitAt = now + PATHFINDER_G + PATHFINDER_RW;
+        } else {
+          // Max retries reached, remove from queue
+          this.pendingAnnounces.delete(destHex);
+        }
+      }
     }
-
-    log(LOG_DEBUG, TAG, `Rebroadcast announce for ${toHex(packet.destinationHash)}`);
   }
 
   /**
@@ -537,6 +588,9 @@ export class Transport extends EventEmitter {
 
   /**
    * Handle an incoming proof packet.
+   * Matches Python Transport.py proof handling:
+   * - LRPROOF: check pendingLinks (initiator side)
+   * - Other proofs: route via reverse table when transport enabled
    * @param {Packet} packet
    */
   _handleProof(packet) {
@@ -564,6 +618,27 @@ export class Transport extends EventEmitter {
         }
         return;
       }
+    }
+
+    // Route proof via reverse table (matching Python Transport.py lines 2085-2100)
+    if (this.enableTransport && this.reverseTable.has(destHex)) {
+      const reverseEntry = this.reverseTable.get(destHex);
+      this.reverseTable.delete(destHex); // one-shot, pop entry
+
+      // Verify proof arrived on the interface we forwarded the original packet to
+      if (packet.receivingInterface === reverseEntry.forwardedOn) {
+        // Route proof back on the interface we received the original packet from
+        const raw = packet.raw;
+        const backIface = reverseEntry.receivedOn;
+        if (backIface && backIface.online) {
+          const toSend = backIface.ifacConfig ? ifacMask(raw, backIface.ifacConfig) : raw;
+          backIface.send(toSend);
+          log(LOG_DEBUG, TAG, `Routed proof for ${destHex} back via ${backIface.name}`);
+        }
+      } else {
+        log(LOG_DEBUG, TAG, `Proof for ${destHex} arrived on wrong interface, not routing`);
+      }
+      return;
     }
 
     log(LOG_DEBUG, TAG, `Received proof for ${destHex}`);
@@ -758,6 +833,81 @@ export class Transport extends EventEmitter {
           }
         }
       }).catch(() => {});
+    }
+  }
+
+  // --- Table maintenance (matching Python Transport.py cull_tables) ---
+
+  /**
+   * Start table maintenance timers. Called by Reticulum on startup.
+   */
+  startMaintenance() {
+    this.stopMaintenance();
+
+    // Announce rebroadcast check every 1s (matching Python announces_check_interval)
+    this._announceCheckTimer = setInterval(
+      () => this._processAnnounceRebroadcasts(),
+      ANNOUNCES_CHECK_INTERVAL * 1000
+    );
+
+    // Table cull every 5s (matching Python tables_cull_interval)
+    this._tableCleanupTimer = setInterval(
+      () => this._cullTables(),
+      TABLES_CULL_INTERVAL * 1000
+    );
+  }
+
+  /**
+   * Stop table maintenance timers.
+   */
+  stopMaintenance() {
+    if (this._announceCheckTimer) {
+      clearInterval(this._announceCheckTimer);
+      this._announceCheckTimer = null;
+    }
+    if (this._tableCleanupTimer) {
+      clearInterval(this._tableCleanupTimer);
+      this._tableCleanupTimer = null;
+    }
+  }
+
+  /**
+   * Cull stale entries from all routing tables.
+   * Matches Python Transport.py lines 599-821.
+   */
+  _cullTables() {
+    const now = Date.now() / 1000;
+
+    // Cull reverse table (REVERSE_TIMEOUT = 8 min)
+    for (const [key, entry] of this.reverseTable) {
+      if (now > entry.timestamp + REVERSE_TIMEOUT) {
+        this.reverseTable.delete(key);
+      } else if (!this.interfaces.includes(entry.forwardedOn)) {
+        this.reverseTable.delete(key);
+      } else if (!this.interfaces.includes(entry.receivedOn)) {
+        this.reverseTable.delete(key);
+      }
+    }
+
+    // Cull expired path table entries
+    for (const [key, entry] of this.pathTable) {
+      if (now > entry.expires) {
+        this.pathTable.delete(key);
+      }
+    }
+
+    // Cull stale announce table entries (DESTINATION_TIMEOUT = 7 days)
+    for (const [key, entry] of this.announceTable) {
+      if (now > entry.timestamp + DESTINATION_TIMEOUT) {
+        this.announceTable.delete(key);
+      }
+    }
+
+    // Cull expired pending announce rebroadcasts
+    for (const [key, entry] of this.pendingAnnounces) {
+      if (entry.retries > PATHFINDER_R) {
+        this.pendingAnnounces.delete(key);
+      }
     }
   }
 

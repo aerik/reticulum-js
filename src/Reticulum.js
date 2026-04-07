@@ -137,6 +137,9 @@ export class Reticulum {
       }
     }
 
+    // Start transport table maintenance timers
+    this.transport.startMaintenance();
+
     this.started = true;
     log(LOG_INFO, TAG, `Started with ${this._interfaces.length} interface(s)`);
   }
@@ -147,6 +150,9 @@ export class Reticulum {
    */
   async stop() {
     log(LOG_INFO, TAG, 'Stopping Reticulum...');
+
+    // Stop transport maintenance timers
+    this.transport.stopMaintenance();
 
     if (this._persistTimer) {
       clearInterval(this._persistTimer);

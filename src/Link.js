@@ -69,6 +69,15 @@ const ECPUBSIZE = 64; // 32 X25519 + 32 Ed25519
 const ESTABLISHMENT_TIMEOUT_PER_HOP = 6; // seconds
 const DEFAULT_FIRST_HOP_TIMEOUT = 15;    // seconds
 
+// Keepalive / stale detection (matching Python RNS/Link.py)
+const KEEPALIVE_MAX = 360;                // 6 min — upper bound for keepalive interval
+const KEEPALIVE_MIN = 5;                  // lower bound
+const KEEPALIVE_MAX_RTT = 1.75;          // RTT at which keepalive hits KEEPALIVE_MAX
+const STALE_FACTOR = 2;                   // stale_time = keepalive * STALE_FACTOR
+const STALE_GRACE = 5;                    // seconds added after entering STALE
+const KEEPALIVE_TIMEOUT_FACTOR = 4;       // RTT multiplier for post-STALE timeout
+const WATCHDOG_INTERVAL = 5;              // seconds — max sleep between watchdog checks
+
 export class Link extends EventEmitter {
   /**
    * Create a link. Usually called via Link.init() (initiator) or Link.validateRequest() (responder).
@@ -109,6 +118,13 @@ export class Link extends EventEmitter {
 
     // Incoming resource tracking
     this._activeResource = null;
+
+    // Keepalive / stale detection (matching Python RNS/Link.py watchdog)
+    this._initiator = false;
+    this.keepalive = KEEPALIVE_MAX;
+    this.staleTime = KEEPALIVE_MAX * STALE_FACTOR;
+    this._lastKeepalive = 0;
+    this._watchdogTimer = null;
   }
 
   /**
@@ -121,6 +137,7 @@ export class Link extends EventEmitter {
     const link = new Link();
     link.destination = destination;
     link._transport = transport;
+    link._initiator = true;
 
     // Generate ephemeral keypairs
     const enc = generateX25519Keypair();
@@ -269,6 +286,8 @@ export class Link extends EventEmitter {
     this.status = LINK_ACTIVE;
     this.establishedAt = Date.now();
     this.lastInbound = Date.now();
+    this._updateKeepalive();
+    this._startWatchdog();
 
     log(LOG_INFO, TAG, `Link established: ${toHex(this.linkId).slice(0, 16)}..`);
 
@@ -293,6 +312,8 @@ export class Link extends EventEmitter {
       this.status = LINK_ACTIVE;
       this.establishedAt = Date.now();
       this.lastInbound = Date.now();
+      this._updateKeepalive();
+      this._startWatchdog();
 
       log(LOG_INFO, TAG, `Link active (responder): ${toHex(this.linkId).slice(0, 16)}..`);
       this.emit('established', this);
@@ -633,6 +654,115 @@ export class Link extends EventEmitter {
     }
   }
 
+  // --- Keepalive / Stale detection (matching Python RNS/Link.py watchdog) ---
+
+  /**
+   * Update keepalive interval based on current RTT.
+   * Matches Python Link.__update_keepalive():
+   *   keepalive = clamp(rtt * KEEPALIVE_MAX/KEEPALIVE_MAX_RTT, KEEPALIVE_MIN, KEEPALIVE_MAX)
+   *   stale_time = keepalive * STALE_FACTOR
+   */
+  _updateKeepalive() {
+    if (this.rtt && this.rtt > 0) {
+      this.keepalive = Math.max(
+        Math.min(this.rtt * (KEEPALIVE_MAX / KEEPALIVE_MAX_RTT), KEEPALIVE_MAX),
+        KEEPALIVE_MIN
+      );
+    } else {
+      this.keepalive = KEEPALIVE_MAX;
+    }
+    this.staleTime = this.keepalive * STALE_FACTOR;
+  }
+
+  /**
+   * Start the watchdog timer that monitors link health.
+   * Matches Python Link.__watchdog_job() behavior.
+   */
+  _startWatchdog() {
+    this._stopWatchdog();
+    this._watchdogTimer = setInterval(() => this._watchdogCheck(), WATCHDOG_INTERVAL * 1000);
+  }
+
+  _stopWatchdog() {
+    if (this._watchdogTimer) {
+      clearInterval(this._watchdogTimer);
+      this._watchdogTimer = null;
+    }
+  }
+
+  /**
+   * Watchdog check — called every WATCHDOG_INTERVAL seconds.
+   * Matching Python Link.__watchdog_job():
+   * - If ACTIVE and no inbound for keepalive period: initiator sends keepalive
+   * - If ACTIVE and no inbound for stale_time: transition to STALE
+   * - If STALE and timeout expires: teardown with TIMEOUT
+   */
+  _watchdogCheck() {
+    if (this.status === LINK_CLOSED) {
+      this._stopWatchdog();
+      return;
+    }
+
+    const now = Date.now();
+    const lastIn = this.lastInbound || this.establishedAt || now;
+    const silenceMs = now - lastIn;
+
+    if (this.status === LINK_ACTIVE) {
+      // Check if we need to send keepalive (initiator only)
+      if (this._initiator && silenceMs >= this.keepalive * 1000) {
+        if (now - this._lastKeepalive >= this.keepalive * 1000) {
+          this._sendKeepalive();
+          this._lastKeepalive = now;
+        }
+      }
+
+      // Check for stale
+      if (silenceMs >= this.staleTime * 1000) {
+        this.status = LINK_STALE;
+        log(LOG_INFO, TAG, `Link stale: ${toHex(this.linkId).slice(0, 16)}.. (no inbound for ${(silenceMs / 1000).toFixed(0)}s)`);
+        this.emit('stale', this);
+
+        // Schedule final timeout: rtt * KEEPALIVE_TIMEOUT_FACTOR + STALE_GRACE
+        const rttMs = (this.rtt || 1) * KEEPALIVE_TIMEOUT_FACTOR * 1000;
+        const graceMs = STALE_GRACE * 1000;
+        this._staleTimeout = setTimeout(() => {
+          if (this.status === LINK_STALE) {
+            log(LOG_INFO, TAG, `Link timeout: ${toHex(this.linkId).slice(0, 16)}..`);
+            this._teardown(TIMEOUT);
+          }
+        }, rttMs + graceMs);
+      }
+    } else if (this.status === LINK_STALE) {
+      // If a packet arrived, the handleKeepalive/handleLinkData code sets
+      // lastInbound, but we also need to recover from STALE → ACTIVE
+      if (silenceMs < this.staleTime * 1000) {
+        this.status = LINK_ACTIVE;
+        if (this._staleTimeout) {
+          clearTimeout(this._staleTimeout);
+          this._staleTimeout = null;
+        }
+        log(LOG_INFO, TAG, `Link recovered from stale: ${toHex(this.linkId).slice(0, 16)}..`);
+      }
+    }
+  }
+
+  /**
+   * Send a keepalive request (0xFF). Only the initiator sends these.
+   * Responder echoes back 0xFE (handled in handleKeepalive).
+   */
+  _sendKeepalive() {
+    const pkt = new Packet();
+    pkt.headerType = HEADER_1;
+    pkt.packetType = PACKET_DATA;
+    pkt.destType = DEST_LINK;
+    pkt.transportType = TRANSPORT_BROADCAST;
+    pkt.destinationHash = this.linkId;
+    pkt.context = CONTEXT_KEEPALIVE;
+    pkt.data = new Uint8Array([0xFF]);
+    this._transport.transmit(pkt);
+    log(LOG_DEBUG, TAG, `Sent keepalive for ${toHex(this.linkId).slice(0, 16)}..`);
+  }
+
   // --- Internal methods ---
 
   _sendLinkRequest() {
@@ -688,14 +818,11 @@ export class Link extends EventEmitter {
     // Calculate RTT from link request to proof receipt
     this.rtt = this.establishedAt ? (Date.now() - this.establishedAt) / 1000 : 0;
 
-    // Pack RTT as a simple float encoded in 4 bytes (we'll use a basic encoding)
-    // Python uses msgpack — we need msgpack compat here
-    // For now, encode RTT as a UTF-8 string of the float
-    // TODO: use proper msgpack encoding for full compatibility
-    const rttBytes = new TextEncoder().encode(String(this.rtt));
+    // Pack RTT as msgpack-encoded float (matching Python RNS/Link.py)
+    const rttBytes = msgpackEncode(this.rtt);
 
     try {
-      await this.send(rttBytes, CONTEXT_LRRTT);
+      await this.send(new Uint8Array(rttBytes), CONTEXT_LRRTT);
       log(LOG_DEBUG, TAG, `Sent RTT packet: ${this.rtt}s`);
     } catch (err) {
       log(LOG_WARNING, TAG, `Failed to send RTT: ${err.message}`);
@@ -722,6 +849,7 @@ export class Link extends EventEmitter {
   }
 
   _teardown(reason) {
+    this._stopWatchdog();
     this.status = LINK_CLOSED;
 
     // Zero out keys
