@@ -900,14 +900,14 @@ export class Transport extends EventEmitter {
 
     // Cull expired path table entries
     for (const [key, entry] of this.pathTable) {
-      if (now > entry.expires) {
+      if (!entry || now > entry.expires) {
         this.pathTable.delete(key);
       }
     }
 
     // Cull stale announce table entries (DESTINATION_TIMEOUT = 7 days)
     for (const [key, entry] of this.announceTable) {
-      if (now > entry.timestamp + DESTINATION_TIMEOUT) {
+      if (!entry || now > entry.timestamp + DESTINATION_TIMEOUT) {
         this.announceTable.delete(key);
       }
     }

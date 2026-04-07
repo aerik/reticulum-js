@@ -117,6 +117,21 @@ async function main() {
     console.log(`    Delivery:    ${toHex(deliveryDest.hash)}`);
     console.log(`    Propagation: ${toHex(router.propagationDestination.hash)}`);
 
+    // Announce after a short delay (let interfaces stabilize)
+    setTimeout(() => {
+      try { router.announceAll(); }
+      catch (e) { console.error(`  Announce error: ${e.message}`); }
+    }, 5000);
+    // Re-announce quickly during startup (every 15s for 2 min), then every 30 min
+    let announceCount = 0;
+    const startupAnnounce = setInterval(() => {
+      try { router.announceAll(); } catch {}
+      if (++announceCount >= 8) clearInterval(startupAnnounce);
+    }, 15000);
+    setInterval(() => {
+      try { router.announceAll(); } catch {}
+    }, 30 * 60 * 1000);
+
     // Periodic message expiry
     setInterval(() => router.expireMessages(), 60000);
 
@@ -247,6 +262,14 @@ async function main() {
 
       res.writeHead(404);
       res.end('Not found');
+    });
+
+    httpServer.on('error', (err) => {
+      if (err.code === 'EADDRINUSE') {
+        console.error(`  HTTP port ${httpPort} in use, API disabled`);
+      } else {
+        console.error(`  HTTP error: ${err.message}`);
+      }
     });
 
     httpServer.listen(httpPort, () => {

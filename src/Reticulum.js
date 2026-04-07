@@ -266,8 +266,8 @@ export class Reticulum {
       case 'TCPServerInterface': {
         iface = new TCPServerInterface(
           config.name || 'TCP Server',
-          config.bind_host || '0.0.0.0',
-          config.bind_port,
+          config.listen_ip || config.bind_host || '0.0.0.0',
+          config.listen_port || config.bind_port,
         );
         if (config.networkname || config.passphrase) {
           iface.configureIfac(config.networkname, config.passphrase, config.ifac_size);

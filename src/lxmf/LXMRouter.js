@@ -25,6 +25,7 @@ import { sha256Hash, truncatedHash } from '../utils/crypto.js';
 import { concat, toHex, equal, fromUtf8 } from '../utils/bytes.js';
 import { log, LOG_DEBUG, LOG_INFO, LOG_WARNING, LOG_ERROR } from '../utils/log.js';
 import { encode as msgpackEncode, decode as msgpackDecode } from '@msgpack/msgpack';
+import { createAnnounce } from '../Announce.js';
 import {
   DEST_IN, DEST_OUT, DEST_SINGLE,
 } from '../constants.js';
@@ -121,6 +122,7 @@ export class LXMRouter extends EventEmitter {
   /**
    * Announce a delivery destination.
    * App data format: msgpack([displayName, stampCost])
+   * Matching Python LXMRouter announce format.
    * @param {Uint8Array} destHash
    */
   announceDelivery(destHash) {
@@ -133,10 +135,40 @@ export class LXMRouter extends EventEmitter {
       : null;
     const appData = new Uint8Array(msgpackEncode([displayNameBytes, entry.stampCost]));
 
-    const { createAnnounce } = require('../Announce.js');
     const pkt = createAnnounce(entry.destination, appData);
     this.transport.transmit(pkt);
     log(LOG_INFO, TAG, `Announced delivery destination: ${destHex}`);
+  }
+
+  /**
+   * Announce all registered delivery destinations.
+   */
+  announceAll() {
+    for (const [destHex, entry] of this.deliveryDestinations) {
+      this.announceDelivery(entry.destination.hash);
+    }
+    if (this.propagationDestination) {
+      this.announcePropagation();
+    }
+  }
+
+  /**
+   * Announce the propagation destination.
+   */
+  announcePropagation() {
+    if (!this.propagationDestination) return;
+    const appData = new Uint8Array(msgpackEncode([
+      null,   // peering key
+      0,      // timebase
+      true,   // propagation enabled
+      PROPAGATION_LIMIT, // transfer limit KB
+      PROPAGATION_LIMIT * 40, // sync limit KB
+      [0, 0, 0], // [stamp_cost, flexibility, peering_cost]
+      {},     // metadata
+    ]));
+    const pkt = createAnnounce(this.propagationDestination, appData);
+    this.transport.transmit(pkt);
+    log(LOG_INFO, TAG, `Announced propagation destination: ${toHex(this.propagationDestination.hash)}`);
   }
 
   /**
