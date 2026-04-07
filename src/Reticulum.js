@@ -236,6 +236,7 @@ export class Reticulum {
       await this.storage.saveKnownDestinations(this.transport.announceTable);
       await this.storage.savePathTable(this.transport.pathTable);
       await this.storage.saveHashlist(this.transport.packetHashlist);
+      await this.storage.pruneAnnounceCache();
       log(LOG_DEBUG, TAG, 'Persisted data');
     } catch (err) {
       log(LOG_WARNING, TAG, `Persist failed: ${err.message}`);

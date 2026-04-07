@@ -48,6 +48,12 @@ const ANNOUNCES_CHECK_INTERVAL = 1;  // seconds — process rebroadcast queue ev
 const REVERSE_TIMEOUT = 8 * 60;      // seconds — reverse table entry lifetime (8 min)
 const DESTINATION_TIMEOUT = 7 * 24 * 60 * 60; // seconds — announce table lifetime (7 days)
 
+// Table size caps (prevent unbounded growth on long-running nodes)
+const MAX_PATH_TABLE_SIZE = 50000;
+const MAX_ANNOUNCE_TABLE_SIZE = 50000;
+const MAX_REVERSE_TABLE_SIZE = 10000;
+const MAX_ANNOUNCE_CACHE_SIZE = 20000;
+
 export class Transport extends EventEmitter {
   /**
    * @param {object} [options]
@@ -875,8 +881,8 @@ export class Transport extends EventEmitter {
   }
 
   /**
-   * Cull stale entries from all routing tables.
-   * Matches Python Transport.py lines 599-821.
+   * Cull stale entries from all routing tables, and enforce size caps.
+   * Matches Python Transport.py lines 599-821, with added size limits.
    */
   _cullTables() {
     const now = Date.now() / 1000;
@@ -912,6 +918,32 @@ export class Transport extends EventEmitter {
         this.pendingAnnounces.delete(key);
       }
     }
+
+    // Enforce size caps — evict oldest entries when over limit
+    this._evictOldest(this.reverseTable, MAX_REVERSE_TABLE_SIZE, 'timestamp');
+    this._evictOldest(this.pathTable, MAX_PATH_TABLE_SIZE, 'timestamp');
+    this._evictOldest(this.announceTable, MAX_ANNOUNCE_TABLE_SIZE, 'timestamp');
+  }
+
+  /**
+   * Evict oldest entries from a Map when it exceeds maxSize.
+   * @param {Map} table
+   * @param {number} maxSize
+   * @param {string} timestampField
+   */
+  _evictOldest(table, maxSize, timestampField) {
+    if (table.size <= maxSize) return;
+
+    // Sort by timestamp ascending, remove oldest
+    const entries = [...table.entries()]
+      .sort((a, b) => (a[1][timestampField] || 0) - (b[1][timestampField] || 0));
+
+    const toRemove = entries.length - maxSize;
+    for (let i = 0; i < toRemove; i++) {
+      table.delete(entries[i][0]);
+    }
+
+    log(LOG_DEBUG, TAG, `Evicted ${toRemove} oldest entries from table (was ${entries.length}, now ${table.size})`);
   }
 
   // --- Dedup helpers ---

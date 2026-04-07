@@ -171,6 +171,25 @@ export class Storage {
     return { raw: new Uint8Array(rawArr), interfaceName };
   }
 
+  /**
+   * Prune announce cache to at most maxEntries, removing oldest first.
+   * @param {number} maxEntries
+   */
+  async pruneAnnounceCache(maxEntries = 20000) {
+    const prefix = 'storage/cache/announces/';
+    const keys = await this.backend.list(prefix);
+    if (keys.length <= maxEntries) return;
+
+    // Sort by key (hex hash — not time-ordered, but stable).
+    // For proper time-ordered eviction we'd need metadata, but this
+    // is sufficient to bound disk usage. Remove the excess.
+    const toRemove = keys.length - maxEntries;
+    for (let i = 0; i < toRemove; i++) {
+      await this.backend.delete(keys[i]);
+    }
+    log(LOG_INFO, TAG, `Pruned announce cache: removed ${toRemove} entries (${keys.length} → ${maxEntries})`);
+  }
+
   // --- Packet Hashlist ---
 
   async saveHashlist(hashlist) {
