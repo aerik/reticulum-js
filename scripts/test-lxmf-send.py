@@ -40,7 +40,7 @@ def main():
   enable_transport = False
   share_instance = No
 [logging]
-  loglevel = 5
+  loglevel = 7
 [interfaces]
   [[RNS Network]]
     type = TCPClientInterface
