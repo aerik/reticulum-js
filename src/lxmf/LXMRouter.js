@@ -203,6 +203,8 @@ export class LXMRouter extends EventEmitter {
 
     // Set up to receive messages as packets or resources on this link
     link.on('data', (plaintext, packet) => {
+      // Send delivery proof (matching Python delivery_packet → packet.prove())
+      if (packet) link.provePacket(packet);
       this._deliveryLinkData(plaintext, destHex, DIRECT);
     });
 

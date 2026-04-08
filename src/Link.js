@@ -185,6 +185,7 @@ export class Link extends EventEmitter {
     link.destination = destination;
     link._transport = transport;
     link._peerEncPub = peerEncPub;
+    link._identity = destination.identity; // for signing proofs
     link.status = LINK_HANDSHAKE;
 
     // Generate our ephemeral X25519 keypair
@@ -764,6 +765,49 @@ export class Link extends EventEmitter {
     pkt.data = new Uint8Array([0xFF]);
     this._transport.transmit(pkt);
     log(LOG_DEBUG, TAG, `Sent keepalive for ${toHex(this.linkId).slice(0, 16)}..`);
+  }
+
+  /**
+   * Send a proof for a received packet.
+   * Matching Python Link.prove_packet():
+   *   proof_data = packet_hash(32) + Ed25519_sign(packet_hash)(64)
+   *   Sent as PROOF packet on the link.
+   *
+   * @param {import('./Packet.js').Packet} packet - The packet to prove
+   */
+  provePacket(packet) {
+    if (!packet || !packet.packetHash) {
+      log(LOG_WARNING, TAG, `Cannot prove packet: no packet hash`);
+      return;
+    }
+
+    try {
+      // Sign the packet hash with our signing key
+      // Responder uses the destination identity's Ed25519 key
+      // Initiator uses the ephemeral Ed25519 key
+      const signingKey = this._sigPriv || (this._identity && this._identity.signingPrivateKey);
+      if (!signingKey) {
+        log(LOG_WARNING, TAG, `Cannot prove packet: no signing key`);
+        return;
+      }
+
+      const signature = ed25519Sign(packet.packetHash, signingKey);
+      const proofData = concat(packet.packetHash, signature);
+
+      const pkt = new Packet();
+      pkt.headerType = HEADER_1;
+      pkt.packetType = PACKET_PROOF;
+      pkt.destType = DEST_LINK;
+      pkt.transportType = TRANSPORT_BROADCAST;
+      pkt.destinationHash = this.linkId;
+      pkt.context = CONTEXT_NONE;
+      pkt.data = proofData;
+
+      this._transport.transmit(pkt);
+      log(LOG_INFO, TAG, `Sent packet proof for ${toHex(packet.packetHash).slice(0, 16)}..`);
+    } catch (err) {
+      log(LOG_WARNING, TAG, `Failed to prove packet: ${err.message}`);
+    }
   }
 
   // --- Internal methods ---
