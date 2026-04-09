@@ -216,7 +216,7 @@ export class LXMessage {
    * @param {import('../Identity.js').Identity} destinationIdentity - Destination's identity (for encryption)
    * @returns {Uint8Array} propagation_packed bytes: msgpack([timestamp, [lxmf_data]])
    */
-  async packForPropagation(destinationIdentity) {
+  async packForPropagation(destinationIdentity, options = {}) {
     if (!this.packed) throw new Error('Message must be packed first');
 
     // Encrypt everything after destination_hash with destination's public key
@@ -229,7 +229,16 @@ export class LXMessage {
     // Transient ID = SHA256(lxmf_data) — before propagation stamp is appended
     this.transientId = sha256Hash(lxmfData);
 
-    // Append propagation stamp if present
+    // Generate / append propagation stamp if a target cost is provided.
+    // Python propagation nodes require a stamp (default cost 16, min 13);
+    // sending without one will be rejected and the link torn down.
+    if (!this.propagationStamp && options.stampCost && options.stampCost > 0) {
+      const { generatePnStamp } = await import('./LXStamper.js');
+      const result = generatePnStamp(this.transientId, options.stampCost);
+      this.propagationStamp = result.stamp;
+      this.propagationStampValue = result.value;
+    }
+
     if (this.propagationStamp) {
       lxmfData = concat(lxmfData, this.propagationStamp);
     }

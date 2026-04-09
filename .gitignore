@@ -6,4 +6,6 @@ dist/
 *.pyc
 __pycache__/
 scripts/.lxmf_test_config/
+scripts/.lxmf_recv_config/
+scripts/.lxmf_send_config/
 examples/.chat_config/

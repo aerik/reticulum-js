@@ -647,9 +647,13 @@ export class LXMRouter extends EventEmitter {
     }
 
     // Build the propagation wrapper (msgpack([timestamp, [encrypted_lxmf_data]]))
+    // Python LXMF propagation nodes require a proof-of-work stamp (default
+    // cost 16, minimum 13). Default to 13 here so unstamped messages don't get
+    // rejected; callers can override via entry.stampCost.
     let propagationData;
     try {
-      propagationData = await message.packForPropagation(recipientIdentity);
+      const stampCost = entry.stampCost || 13;
+      propagationData = await message.packForPropagation(recipientIdentity, { stampCost });
     } catch (err) {
       log(LOG_WARNING, TAG, `packForPropagation failed: ${err.message}`);
       entry.nextAttempt = Date.now() + this.DELIVERY_RETRY_WAIT;

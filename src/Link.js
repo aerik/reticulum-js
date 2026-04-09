@@ -862,7 +862,8 @@ export class Link extends EventEmitter {
     }
 
     try {
-      const valid = ed25519Verify(packetHash, signature, sigPub);
+      // ed25519Verify(signature, message, publicKey)
+      const valid = ed25519Verify(signature, packetHash, sigPub);
       if (!valid) {
         log(LOG_WARNING, TAG, `Packet proof signature invalid for ${hashHex.slice(0, 16)}..`);
         pending.reject(new Error('Invalid packet proof signature'));
