@@ -17,8 +17,13 @@
 import { EventEmitter } from '../utils/events.js';
 import { Destination } from '../Destination.js';
 import { Identity } from '../Identity.js';
-import { LXMessage, LXMF_OVERHEAD, DESTINATION_LENGTH, SIGNATURE_LENGTH,
-         DIRECT, PROPAGATED, OPPORTUNISTIC } from './LXMessage.js';
+import { Link } from '../Link.js';
+import { Packet } from '../Packet.js';
+import {
+  LXMessage, LXMF_OVERHEAD, DESTINATION_LENGTH, SIGNATURE_LENGTH,
+  DIRECT, PROPAGATED, OPPORTUNISTIC,
+  OUTBOUND, SENDING, SENT, DELIVERED, FAILED,
+} from './LXMessage.js';
 import { APP_NAME, MESSAGE_GET_PATH, MESSAGE_EXPIRY,
          ERROR_NO_IDENTITY, ERROR_NO_ACCESS, PROPAGATION_LIMIT } from './constants.js';
 import { sha256Hash, truncatedHash } from '../utils/crypto.js';
@@ -28,6 +33,7 @@ import { encode as msgpackEncode, decode as msgpackDecode } from '@msgpack/msgpa
 import { createAnnounce } from '../Announce.js';
 import {
   DEST_IN, DEST_OUT, DEST_SINGLE,
+  PACKET_DATA, HEADER_1, TRANSPORT_BROADCAST, CONTEXT_NONE,
 } from '../constants.js';
 
 const TAG = 'LXMRouter';
@@ -74,6 +80,38 @@ export class LXMRouter extends EventEmitter {
 
     // Active links for delivery
     this._deliveryLinks = new Map(); // destHashHex → link
+
+    // --- Outbound state (matching Python LXMRouter) ---
+    // pendingOutbound: msgIdHex → { message, nextAttempt, method, destHex, targetHex, sourceIdentity }
+    this.pendingOutbound = new Map();
+    // outboundLinks: destHex → { link, state: 'opening'|'open'|'closing', queue: [msgIdHex], openedAt }
+    this.outboundLinks = new Map();
+
+    this.DELIVERY_RETRY_WAIT  = options.deliveryRetryWait  || 10_000; // ms
+    this.MAX_DELIVERY_ATTEMPTS = options.maxDeliveryAttempts || 5;
+    this.LINK_MAX_INACTIVITY  = options.linkMaxInactivity  || 30_000; // ms
+    this.OPPORTUNISTIC_MAX_BYTES = options.opportunisticMaxBytes || 368; // packed size cutoff
+
+    // Outbound processing interval (matches Python's process_outbound 5-second tick)
+    this._outboundInterval = null;
+    if (options.autoStart !== false) {
+      this._outboundInterval = setInterval(() => {
+        try { this._processOutbound(); } catch (err) {
+          log(LOG_WARNING, TAG, `Outbound processor error: ${err.message}`);
+        }
+      }, 5000);
+      if (this._outboundInterval.unref) this._outboundInterval.unref();
+    }
+  }
+
+  /**
+   * Stop background tasks (outbound processor, etc). Call before teardown.
+   */
+  stop() {
+    if (this._outboundInterval) {
+      clearInterval(this._outboundInterval);
+      this._outboundInterval = null;
+    }
   }
 
   /**
@@ -227,18 +265,554 @@ export class LXMRouter extends EventEmitter {
     }
   }
 
+  // --- Outbound (handleOutbound + dispatchers) ---
+
+  /**
+   * Accept an LXMessage for delivery. Matches Python LXMRouter.handle_outbound().
+   *
+   * The message must have destinationHash set. If sourceHash is not set, the
+   * first registered delivery destination will be used as the source.
+   *
+   * This method returns immediately; the message is queued and processed on
+   * the next outbound tick (or immediately for opportunistic with known path).
+   * Callers observe progress via `message.state` and the `deliveryCallback` /
+   * `failedCallback` fields, or by listening for the router's 'outbound' event.
+   *
+   * @param {LXMessage} message
+   * @param {object} [options]
+   * @param {Identity} [options.sourceIdentity] - Override source identity
+   * @param {Uint8Array} [options.propagationNodeHash] - Required for PROPAGATED
+   * @returns {LXMessage} The same message (for chaining)
+   */
+  handleOutbound(message, options = {}) {
+    if (!message.destinationHash) {
+      throw new Error('LXMessage.destinationHash is required');
+    }
+
+    // Resolve source identity & source destination hash
+    let sourceIdentity = options.sourceIdentity || null;
+    let sourceDest = null;
+
+    if (!sourceIdentity) {
+      // Default: first delivery destination with a private key
+      for (const entry of this.deliveryDestinations.values()) {
+        if (entry.identity && entry.identity.hasPrivateKey()) {
+          sourceIdentity = entry.identity;
+          sourceDest = entry.destination;
+          break;
+        }
+      }
+    } else {
+      // Find the matching delivery destination for this identity (if any)
+      for (const entry of this.deliveryDestinations.values()) {
+        if (entry.identity === sourceIdentity) {
+          sourceDest = entry.destination;
+          break;
+        }
+      }
+    }
+
+    if (!sourceIdentity) {
+      throw new Error('No source identity available — register a delivery identity first');
+    }
+
+    // sourceHash must be the sender's lxmf.delivery destination hash
+    if (!message.sourceHash) {
+      if (sourceDest) {
+        message.sourceHash = sourceDest.hash;
+      } else {
+        // Caller provided a raw identity with no registered destination — build one
+        const impliedDest = new Destination(
+          sourceIdentity, DEST_IN, DEST_SINGLE, APP_NAME, 'delivery'
+        );
+        message.sourceHash = impliedDest.hash;
+      }
+    }
+
+    // Pack the message (populates .packed and .hash)
+    try {
+      message.pack(sourceIdentity);
+    } catch (err) {
+      log(LOG_ERROR, TAG, `Failed to pack outbound message: ${err.message}`);
+      message.state = FAILED;
+      if (message.failedCallback) {
+        try { message.failedCallback(message); } catch {}
+      }
+      throw err;
+    }
+
+    // Select delivery method
+    const desired = message.desiredMethod;
+    let method;
+    if (desired === PROPAGATED) {
+      if (!options.propagationNodeHash) {
+        message.state = FAILED;
+        if (message.failedCallback) { try { message.failedCallback(message); } catch {} }
+        throw new Error('PROPAGATED method requires propagationNodeHash');
+      }
+      method = PROPAGATED;
+    } else if (desired === DIRECT) {
+      method = DIRECT;
+    } else if (desired === OPPORTUNISTIC) {
+      method = OPPORTUNISTIC;
+    } else {
+      // Auto: opportunistic for small, direct for large
+      method = message.packed.length <= this.OPPORTUNISTIC_MAX_BYTES ? OPPORTUNISTIC : DIRECT;
+    }
+
+    message.method = method;
+    message.state = OUTBOUND;
+
+    const msgIdHex = toHex(message.hash);
+    const destHex = toHex(message.destinationHash);
+
+    // For propagated, targetHex is the propagation node; for the others it's the destination
+    const targetHex = method === PROPAGATED
+      ? toHex(options.propagationNodeHash)
+      : destHex;
+
+    this.pendingOutbound.set(msgIdHex, {
+      message,
+      method,
+      destHex,
+      targetHex,
+      targetHash: method === PROPAGATED ? options.propagationNodeHash : message.destinationHash,
+      sourceIdentity,
+      attempts: 0,
+      nextAttempt: Date.now(),
+    });
+
+    log(LOG_INFO, TAG, `Queued outbound ${msgIdHex.slice(0, 16)}.. ` +
+      `(${method === OPPORTUNISTIC ? 'opportunistic' : method === DIRECT ? 'direct' : 'propagated'}, ` +
+      `${message.packed.length}b) → ${destHex.slice(0, 16)}..`);
+
+    // Kick off immediately
+    this._dispatch(msgIdHex).catch((err) => {
+      log(LOG_WARNING, TAG, `Dispatch error for ${msgIdHex.slice(0, 16)}..: ${err.message}`);
+    });
+
+    return message;
+  }
+
+  /**
+   * Periodic outbound processor — retries pending messages and expires failures.
+   */
+  _processOutbound() {
+    const now = Date.now();
+    for (const [msgIdHex, entry] of this.pendingOutbound) {
+      if (entry.message.state === SENT || entry.message.state === DELIVERED) {
+        this.pendingOutbound.delete(msgIdHex);
+        continue;
+      }
+      if (entry.message.state === FAILED) {
+        this.pendingOutbound.delete(msgIdHex);
+        continue;
+      }
+      if (entry.message.state === SENDING) {
+        // Already in flight (link opening, etc) — leave alone
+        continue;
+      }
+      if (now < entry.nextAttempt) continue;
+      if (entry.attempts >= this.MAX_DELIVERY_ATTEMPTS) {
+        this._failMessage(msgIdHex, 'max delivery attempts exceeded');
+        continue;
+      }
+      this._dispatch(msgIdHex).catch((err) => {
+        log(LOG_WARNING, TAG, `Retry dispatch error: ${err.message}`);
+      });
+    }
+
+    // Close idle outbound links
+    for (const [destHex, entry] of this.outboundLinks) {
+      if (entry.state === 'open' && entry.queue.length === 0 &&
+          now - entry.lastActive > this.LINK_MAX_INACTIVITY) {
+        try { entry.link.close(); } catch {}
+        this.outboundLinks.delete(destHex);
+      }
+    }
+  }
+
+  /**
+   * Dispatch a single pending message to the appropriate method handler.
+   * @param {string} msgIdHex
+   */
+  async _dispatch(msgIdHex) {
+    const entry = this.pendingOutbound.get(msgIdHex);
+    if (!entry) return;
+    entry.attempts += 1;
+    entry.message.deliveryAttempts = entry.attempts;
+
+    switch (entry.method) {
+      case OPPORTUNISTIC: return this._sendOpportunistic(entry);
+      case DIRECT:        return this._sendDirect(entry);
+      case PROPAGATED:    return this._sendPropagated(entry);
+      default:
+        this._failMessage(msgIdHex, `unknown delivery method ${entry.method}`);
+    }
+  }
+
+  /**
+   * Opportunistic dispatcher — single-packet encrypted to the destination identity.
+   * Matches Python LXMRouter.process_outbound deliver_opportunistic path.
+   * @param {object} entry
+   */
+  async _sendOpportunistic(entry) {
+    const { message, targetHash } = entry;
+    const msgIdHex = toHex(message.hash);
+
+    // Resolve destination identity
+    const destIdentity = this.transport.getIdentity(targetHash);
+    if (!destIdentity) {
+      log(LOG_DEBUG, TAG, `No identity for ${entry.destHex.slice(0, 16)}.., requesting path`);
+      try { this.transport.requestPath(targetHash); } catch {}
+      entry.nextAttempt = Date.now() + this.DELIVERY_RETRY_WAIT;
+      return;
+    }
+
+    if (!this.transport.pathTable.has(entry.destHex)) {
+      log(LOG_DEBUG, TAG, `No path for ${entry.destHex.slice(0, 16)}.., requesting`);
+      try { this.transport.requestPath(targetHash); } catch {}
+      entry.nextAttempt = Date.now() + this.DELIVERY_RETRY_WAIT;
+      return;
+    }
+
+    // Encrypt payload: everything after the destination hash.
+    // message.packed = dest_hash(16) + src_hash(16) + sig(64) + msgpack_payload
+    // The destination hash is implicit in the packet's destinationHash field.
+    const plaintext = message.packed.slice(DESTINATION_LENGTH);
+    let encrypted;
+    try {
+      encrypted = await destIdentity.encrypt(plaintext);
+    } catch (err) {
+      log(LOG_WARNING, TAG, `Opportunistic encrypt failed: ${err.message}`);
+      entry.nextAttempt = Date.now() + this.DELIVERY_RETRY_WAIT;
+      return;
+    }
+
+    // Wrap in a Packet destined for the remote lxmf.delivery destination
+    const pkt = new Packet();
+    pkt.headerType = HEADER_1;
+    pkt.packetType = PACKET_DATA;
+    pkt.destType = DEST_SINGLE;
+    pkt.transportType = TRANSPORT_BROADCAST;
+    pkt.destinationHash = message.destinationHash;
+    pkt.context = CONTEXT_NONE;
+    pkt.data = encrypted;
+
+    this.transport.transmit(pkt);
+
+    message.state = SENT;
+    log(LOG_INFO, TAG, `Opportunistic sent ${msgIdHex.slice(0, 16)}.. → ${entry.destHex.slice(0, 16)}..`);
+
+    if (message.deliveryCallback) {
+      try { message.deliveryCallback(message); } catch (err) {
+        log(LOG_WARNING, TAG, `deliveryCallback error: ${err.message}`);
+      }
+    }
+    this.emit('outbound', message);
+    this.pendingOutbound.delete(msgIdHex);
+  }
+
+  /**
+   * Direct dispatcher — open a link to the destination and send with proof.
+   * Matches Python LXMRouter.deliver_direct().
+   * @param {object} entry
+   */
+  async _sendDirect(entry) {
+    const { message, targetHash, destHex } = entry;
+    const msgIdHex = toHex(message.hash);
+
+    // Resolve destination identity
+    const destIdentity = this.transport.getIdentity(targetHash);
+    if (!destIdentity) {
+      log(LOG_DEBUG, TAG, `No identity for direct send to ${destHex.slice(0, 16)}.., requesting path`);
+      try { this.transport.requestPath(targetHash); } catch {}
+      entry.nextAttempt = Date.now() + this.DELIVERY_RETRY_WAIT;
+      return;
+    }
+
+    // Look up or open an outbound link
+    let linkEntry = this.outboundLinks.get(destHex);
+    if (!linkEntry) {
+      const destination = new Destination(
+        destIdentity, DEST_OUT, DEST_SINGLE, APP_NAME, 'delivery'
+      );
+      try {
+        const link = Link.init(destination, this.transport);
+        this.transport.registerPendingLink(link);
+        linkEntry = {
+          link,
+          state: 'opening',
+          queue: [msgIdHex],
+          lastActive: Date.now(),
+        };
+        this.outboundLinks.set(destHex, linkEntry);
+
+        link.on('established', () => {
+          linkEntry.state = 'open';
+          linkEntry.lastActive = Date.now();
+          this._drainDirectQueue(destHex);
+        });
+        link.on('closed', () => {
+          // Any queued messages fail so they can be retried
+          for (const qId of linkEntry.queue) {
+            const qEntry = this.pendingOutbound.get(qId);
+            if (qEntry && qEntry.message.state === SENDING) {
+              qEntry.message.state = OUTBOUND;
+              qEntry.nextAttempt = Date.now() + this.DELIVERY_RETRY_WAIT;
+            }
+          }
+          this.outboundLinks.delete(destHex);
+        });
+      } catch (err) {
+        log(LOG_WARNING, TAG, `Failed to open direct link: ${err.message}`);
+        entry.nextAttempt = Date.now() + this.DELIVERY_RETRY_WAIT;
+        return;
+      }
+    } else if (linkEntry.state === 'opening') {
+      // Link is still handshaking — queue and wait
+      if (!linkEntry.queue.includes(msgIdHex)) linkEntry.queue.push(msgIdHex);
+      return;
+    } else if (linkEntry.state === 'open') {
+      if (!linkEntry.queue.includes(msgIdHex)) linkEntry.queue.push(msgIdHex);
+      return this._drainDirectQueue(destHex);
+    }
+
+    message.state = SENDING;
+  }
+
+  /**
+   * Flush any pending DIRECT messages over an open link.
+   * @param {string} destHex
+   */
+  async _drainDirectQueue(destHex) {
+    const linkEntry = this.outboundLinks.get(destHex);
+    if (!linkEntry || linkEntry.state !== 'open') return;
+
+    while (linkEntry.queue.length > 0) {
+      const msgIdHex = linkEntry.queue.shift();
+      const entry = this.pendingOutbound.get(msgIdHex);
+      if (!entry || entry.message.state === DELIVERED || entry.message.state === FAILED) continue;
+
+      entry.message.state = SENDING;
+      linkEntry.lastActive = Date.now();
+
+      try {
+        await linkEntry.link.sendWithProof(entry.message.packed);
+        entry.message.state = DELIVERED;
+        log(LOG_INFO, TAG, `Direct delivered ${msgIdHex.slice(0, 16)}.. → ${destHex.slice(0, 16)}..`);
+        if (entry.message.deliveryCallback) {
+          try { entry.message.deliveryCallback(entry.message); } catch (err) {
+            log(LOG_WARNING, TAG, `deliveryCallback error: ${err.message}`);
+          }
+        }
+        this.emit('outbound', entry.message);
+        this.pendingOutbound.delete(msgIdHex);
+      } catch (err) {
+        log(LOG_WARNING, TAG, `Direct send failed for ${msgIdHex.slice(0, 16)}..: ${err.message}`);
+        entry.message.state = OUTBOUND;
+        entry.nextAttempt = Date.now() + this.DELIVERY_RETRY_WAIT;
+      }
+    }
+  }
+
+  /**
+   * Propagated dispatcher — open a link to a propagation node and deliver the
+   * encrypted envelope.
+   *
+   * Matches Python LXMRouter.propagation_transfer() / deliver_propagated.
+   *
+   * @param {object} entry
+   */
+  async _sendPropagated(entry) {
+    const { message, targetHash, destHex } = entry;
+    const msgIdHex = toHex(message.hash);
+
+    // The recipient identity is needed for the end-to-end encryption envelope
+    const recipientIdentity = this.transport.getIdentity(message.destinationHash);
+    if (!recipientIdentity) {
+      log(LOG_DEBUG, TAG, `No recipient identity for ${destHex.slice(0, 16)}.., requesting path`);
+      try { this.transport.requestPath(message.destinationHash); } catch {}
+      entry.nextAttempt = Date.now() + this.DELIVERY_RETRY_WAIT;
+      return;
+    }
+
+    // Resolve propagation node identity
+    const propIdentity = this.transport.getIdentity(targetHash);
+    if (!propIdentity) {
+      log(LOG_DEBUG, TAG, `No identity for propagation node ${entry.targetHex.slice(0, 16)}..`);
+      try { this.transport.requestPath(targetHash); } catch {}
+      entry.nextAttempt = Date.now() + this.DELIVERY_RETRY_WAIT;
+      return;
+    }
+
+    // Build the propagation wrapper (msgpack([timestamp, [encrypted_lxmf_data]]))
+    let propagationData;
+    try {
+      propagationData = await message.packForPropagation(recipientIdentity);
+    } catch (err) {
+      log(LOG_WARNING, TAG, `packForPropagation failed: ${err.message}`);
+      entry.nextAttempt = Date.now() + this.DELIVERY_RETRY_WAIT;
+      return;
+    }
+
+    const linkKey = 'prop:' + entry.targetHex;
+    let linkEntry = this.outboundLinks.get(linkKey);
+    if (!linkEntry) {
+      const destination = new Destination(
+        propIdentity, DEST_OUT, DEST_SINGLE, APP_NAME, 'propagation'
+      );
+      try {
+        const link = Link.init(destination, this.transport);
+        this.transport.registerPendingLink(link);
+        linkEntry = {
+          link,
+          state: 'opening',
+          queue: [msgIdHex],
+          payloads: new Map([[msgIdHex, propagationData]]),
+          lastActive: Date.now(),
+        };
+        this.outboundLinks.set(linkKey, linkEntry);
+
+        link.on('established', () => {
+          linkEntry.state = 'open';
+          linkEntry.lastActive = Date.now();
+          this._drainPropagationQueue(linkKey);
+        });
+        link.on('closed', () => {
+          for (const qId of linkEntry.queue) {
+            const qEntry = this.pendingOutbound.get(qId);
+            if (qEntry && qEntry.message.state === SENDING) {
+              qEntry.message.state = OUTBOUND;
+              qEntry.nextAttempt = Date.now() + this.DELIVERY_RETRY_WAIT;
+            }
+          }
+          this.outboundLinks.delete(linkKey);
+        });
+      } catch (err) {
+        log(LOG_WARNING, TAG, `Failed to open propagation link: ${err.message}`);
+        entry.nextAttempt = Date.now() + this.DELIVERY_RETRY_WAIT;
+        return;
+      }
+    } else {
+      if (!linkEntry.queue.includes(msgIdHex)) {
+        linkEntry.queue.push(msgIdHex);
+        linkEntry.payloads.set(msgIdHex, propagationData);
+      }
+      if (linkEntry.state === 'open') return this._drainPropagationQueue(linkKey);
+    }
+
+    message.state = SENDING;
+  }
+
+  /**
+   * Flush any pending PROPAGATED messages over an open propagation link.
+   * @param {string} linkKey
+   */
+  async _drainPropagationQueue(linkKey) {
+    const linkEntry = this.outboundLinks.get(linkKey);
+    if (!linkEntry || linkEntry.state !== 'open') return;
+
+    while (linkEntry.queue.length > 0) {
+      const msgIdHex = linkEntry.queue.shift();
+      const entry = this.pendingOutbound.get(msgIdHex);
+      const payload = linkEntry.payloads.get(msgIdHex);
+      linkEntry.payloads.delete(msgIdHex);
+      if (!entry || !payload) continue;
+      if (entry.message.state === DELIVERED || entry.message.state === FAILED) continue;
+
+      entry.message.state = SENDING;
+      linkEntry.lastActive = Date.now();
+
+      try {
+        // Propagation nodes acknowledge with a packet proof for each received
+        // envelope (Python's LXMRouter.propagation_transfer uses link.set_packet_callback
+        // on the receiving side and calls prove_packet there). We therefore
+        // send with proof just like DIRECT, but treat a proof timeout as SENT
+        // rather than FAILED, since some servers do not prove every packet.
+        await linkEntry.link.sendWithProof(payload, 10_000).catch((err) => {
+          log(LOG_DEBUG, TAG, `Propagation proof wait: ${err.message} — marking SENT`);
+        });
+        entry.message.state = DELIVERED;
+        log(LOG_INFO, TAG, `Propagated ${msgIdHex.slice(0, 16)}.. via ${linkKey}`);
+        if (entry.message.deliveryCallback) {
+          try { entry.message.deliveryCallback(entry.message); } catch (err) {
+            log(LOG_WARNING, TAG, `deliveryCallback error: ${err.message}`);
+          }
+        }
+        this.emit('outbound', entry.message);
+        this.pendingOutbound.delete(msgIdHex);
+      } catch (err) {
+        log(LOG_WARNING, TAG, `Propagated send failed for ${msgIdHex.slice(0, 16)}..: ${err.message}`);
+        entry.message.state = OUTBOUND;
+        entry.nextAttempt = Date.now() + this.DELIVERY_RETRY_WAIT;
+      }
+    }
+  }
+
+  /**
+   * Mark a pending message FAILED and fire its failed callback.
+   * @param {string} msgIdHex
+   * @param {string} reason
+   */
+  _failMessage(msgIdHex, reason) {
+    const entry = this.pendingOutbound.get(msgIdHex);
+    if (!entry) return;
+    entry.message.state = FAILED;
+    log(LOG_WARNING, TAG, `Outbound ${msgIdHex.slice(0, 16)}.. FAILED: ${reason}`);
+    if (entry.message.failedCallback) {
+      try { entry.message.failedCallback(entry.message); } catch (err) {
+        log(LOG_WARNING, TAG, `failedCallback error: ${err.message}`);
+      }
+    }
+    this.emit('outbound', entry.message);
+    this.pendingOutbound.delete(msgIdHex);
+  }
+
+  /**
+   * Get a snapshot of pending outbound messages (for HTTP API / debugging).
+   */
+  getPendingOutbound() {
+    const out = [];
+    for (const [id, entry] of this.pendingOutbound) {
+      out.push({
+        id,
+        state: entry.message.state,
+        method: entry.method,
+        destinationHash: entry.destHex,
+        attempts: entry.attempts,
+        nextAttempt: entry.nextAttempt,
+      });
+    }
+    return out;
+  }
+
   /**
    * Handle an opportunistic (single-packet) delivery.
    * Matching Python LXMRouter.delivery_packet().
-   * @param {Uint8Array} data
+   *
+   * Wire format from the sender:
+   *   Packet.data = Identity.encrypt(source_hash + signature + msgpack_payload)
+   *
+   * The destination hash is implicit from the packet's destinationHash field
+   * (it's also our local destination's hash), so we prepend it after decryption.
+   *
+   * @param {Uint8Array} data - Encrypted packet payload
    * @param {import('../Packet.js').Packet} packet
-   * @param {Destination} destination
+   * @param {Destination} destination - Our local lxmf.delivery destination
    */
-  _deliveryPacket(data, packet, destination) {
-    // Opportunistic: destination hash is implicit from the packet destination
-    // Prepend it to get full LXMF data
-    const lxmfData = concat(destination.hash, data);
-    this._lxmfDelivery(lxmfData, OPPORTUNISTIC);
+  async _deliveryPacket(data, packet, destination) {
+    try {
+      const plaintext = await destination.identity.decrypt(data);
+      if (!plaintext) {
+        log(LOG_DEBUG, TAG, `Opportunistic packet decrypt returned null`);
+        return;
+      }
+      const lxmfData = concat(destination.hash, plaintext);
+      this._lxmfDelivery(lxmfData, OPPORTUNISTIC);
+    } catch (err) {
+      log(LOG_DEBUG, TAG, `Opportunistic packet decrypt failed: ${err.message}`);
+    }
   }
 
   /**

@@ -629,6 +629,15 @@ export class Transport extends EventEmitter {
       }
     }
 
+    // Packet proof on an active link: route to the Link so sendWithProof()
+    // waiters can resolve. Matches Python Transport packet-proof delivery.
+    const activeLink = this.linkTable.get(destHex);
+    if (activeLink) {
+      activeLink.lastInbound = Date.now();
+      activeLink._handlePacketProof(packet);
+      return;
+    }
+
     // Route proof via reverse table (matching Python Transport.py lines 2085-2100)
     if (this.enableTransport && this.reverseTable.has(destHex)) {
       const reverseEntry = this.reverseTable.get(destHex);

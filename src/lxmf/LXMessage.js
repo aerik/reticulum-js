@@ -107,6 +107,11 @@ export class LXMessage {
     this.fields = opts.fields || {};
     this.timestamp = opts.timestamp || null;
 
+    // Delivery callbacks (matching Python LXMessage.delivery_callback / failed_callback)
+    this.deliveryCallback = opts.deliveryCallback || null;
+    this.failedCallback = opts.failedCallback || null;
+    this.deliveryAttempts = 0;
+
     this.hash = null;           // 32 bytes — message ID
     this.messageId = null;      // alias for hash
     this.signature = null;      // 64 bytes Ed25519
@@ -211,12 +216,12 @@ export class LXMessage {
    * @param {import('../Identity.js').Identity} destinationIdentity - Destination's identity (for encryption)
    * @returns {Uint8Array} propagation_packed bytes: msgpack([timestamp, [lxmf_data]])
    */
-  packForPropagation(destinationIdentity) {
+  async packForPropagation(destinationIdentity) {
     if (!this.packed) throw new Error('Message must be packed first');
 
     // Encrypt everything after destination_hash with destination's public key
     const toEncrypt = this.packed.slice(DESTINATION_LENGTH);
-    const encrypted = destinationIdentity.encrypt(toEncrypt);
+    const encrypted = await destinationIdentity.encrypt(toEncrypt);
 
     // lxmf_data = destination_hash + encrypted_blob
     let lxmfData = concat(this.packed.slice(0, DESTINATION_LENGTH), encrypted);

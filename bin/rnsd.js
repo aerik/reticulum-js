@@ -19,7 +19,7 @@
 import { Reticulum } from '../src/Reticulum.js';
 import { resolveConfigDir, loadConfig } from '../src/utils/config.js';
 import { setLogLevel, LOG_INFO, LOG_VERBOSE, LOG_DEBUG, LOG_EXTREME } from '../src/utils/log.js';
-import { toHex } from '../src/utils/bytes.js';
+import { toHex, fromHex } from '../src/utils/bytes.js';
 import { readFile } from 'fs/promises';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
@@ -158,10 +158,12 @@ async function main() {
 
       // CORS
       res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader('Access-Control-Allow-Methods', 'GET');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+      if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
       // --- API endpoints ---
-      if (path === '/api/messages') {
+      if (path === '/api/messages' && req.method === 'GET') {
         const messages = router ? router.getDeliveredMessages() : [];
         const json = messages.map(m => ({
           id: m.id,
@@ -180,14 +182,85 @@ async function main() {
         return;
       }
 
-      if (path.startsWith('/api/messages/')) {
+      // --- Outbound send ---
+      if (path === '/api/messages' && req.method === 'POST') {
+        if (!router) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'LXMF not enabled' }));
+          return;
+        }
+        try {
+          const chunks = [];
+          for await (const chunk of req) chunks.push(chunk);
+          const body = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
+
+          const destHashHex = (body.destinationHash || '').replace(/\s+/g, '');
+          if (!/^[0-9a-f]{32}$/i.test(destHashHex)) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'destinationHash must be 32 hex chars' }));
+            return;
+          }
+
+          const { LXMessage, OPPORTUNISTIC, DIRECT, PROPAGATED } =
+            await import('../src/lxmf/LXMessage.js');
+          const methodMap = {
+            opportunistic: OPPORTUNISTIC,
+            direct: DIRECT,
+            propagated: PROPAGATED,
+          };
+          const desired = body.method ? methodMap[body.method.toLowerCase()] : null;
+          if (body.method && !desired) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'method must be opportunistic|direct|propagated' }));
+            return;
+          }
+
+          const msg = new LXMessage({
+            destinationHash: fromHex(destHashHex),
+            title: body.title || '',
+            content: body.content || '',
+            desiredMethod: desired,
+          });
+
+          const opts = {};
+          if (desired === PROPAGATED) {
+            if (!body.propagationNodeHash || !/^[0-9a-f]{32}$/i.test(body.propagationNodeHash)) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'propagationNodeHash required (32 hex chars)' }));
+              return;
+            }
+            opts.propagationNodeHash = fromHex(body.propagationNodeHash);
+          }
+
+          router.handleOutbound(msg, opts);
+
+          res.writeHead(202, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            id: toHex(msg.hash),
+            state: msg.state,
+            method: msg.method,
+            packedSize: msg.packedSize,
+            sourceHash: msg.sourceHash ? toHex(msg.sourceHash) : null,
+          }));
+          return;
+        } catch (err) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: err.message }));
+          return;
+        }
+      }
+
+      if (path.startsWith('/api/messages/') && req.method === 'GET') {
         const id = path.slice('/api/messages/'.length);
+
+        // Delivered (received) messages
         const messages = router ? router.getDeliveredMessages() : [];
         const found = messages.find(m => m.id === id);
         if (found) {
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({
             id: found.id,
+            direction: 'inbound',
             timestamp: found.message.timestamp,
             received: found.received,
             sourceHash: toHex(found.message.sourceHash),
@@ -197,11 +270,31 @@ async function main() {
             fields: found.message.fields,
             signatureValidated: found.message.signatureValidated,
             method: found.message.method,
+            state: found.message.state,
           }));
-        } else {
-          res.writeHead(404, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Message not found' }));
+          return;
         }
+
+        // Pending outbound (in flight)
+        if (router && router.pendingOutbound && router.pendingOutbound.has(id)) {
+          const entry = router.pendingOutbound.get(id);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            id,
+            direction: 'outbound',
+            state: entry.message.state,
+            method: entry.method,
+            destinationHash: entry.destHex,
+            attempts: entry.attempts,
+            nextAttempt: entry.nextAttempt,
+            title: entry.message.title,
+            content: entry.message.content,
+          }));
+          return;
+        }
+
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Message not found' }));
         return;
       }
 

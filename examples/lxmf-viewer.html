@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>LXMF Messages</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: #0f1419; color: #e7e9ea;
+    padding: 20px; max-width: 900px; margin: 0 auto;
+  }
+  h1 { color: #1d9bf0; margin-bottom: 4px; }
+  h2 { color: #8b98a5; font-size: 0.9em; font-weight: 500; margin: 16px 0 8px; }
+  .stats { font-size: 0.85em; color: #8b98a5; margin-bottom: 16px; }
+
+  .panel {
+    background: #16202a; border: 1px solid #2f3336; border-radius: 8px;
+    padding: 14px 16px; margin-bottom: 16px;
+  }
+  .panel h3 { font-size: 0.95em; color: #e7e9ea; margin-bottom: 10px; }
+
+  .row { display: flex; gap: 8px; margin-bottom: 8px; }
+  label { display: block; font-size: 0.8em; color: #8b98a5; margin-bottom: 3px; }
+
+  input, select, textarea {
+    width: 100%; background: #202327; border: 1px solid #333639; color: #e7e9ea;
+    padding: 6px 10px; border-radius: 4px; font-size: 0.9em; font-family: inherit;
+  }
+  textarea { resize: vertical; min-height: 60px; }
+  input:focus, textarea:focus, select:focus { outline: 1px solid #1d9bf0; border-color: #1d9bf0; }
+
+  button {
+    background: #1d9bf0; color: white; border: none;
+    padding: 8px 18px; border-radius: 16px; cursor: pointer;
+    font-weight: 600; font-size: 0.9em;
+  }
+  button:hover { background: #1a8cd8; }
+  button:disabled { background: #536471; cursor: not-allowed; }
+  .btn-refresh { background: transparent; color: #1d9bf0; border: 1px solid #1d9bf0; }
+
+  #send-status { font-size: 0.85em; margin-top: 8px; min-height: 18px; }
+  #send-status.ok { color: #00ba7c; }
+  #send-status.err { color: #f4212e; }
+  #send-status.pending { color: #ffd400; }
+
+  .msg {
+    background: #16202a; border: 1px solid #2f3336; border-radius: 8px;
+    padding: 12px 16px; margin-bottom: 8px;
+  }
+  .msg .from { color: #1d9bf0; font-family: monospace; font-size: 0.85em; }
+  .msg .title { font-weight: 600; margin: 4px 0; }
+  .msg .content { color: #b3b1ad; white-space: pre-wrap; }
+  .msg .meta { font-size: 0.75em; color: #536471; margin-top: 4px; }
+  .empty { color: #536471; text-align: center; padding: 40px; }
+</style>
+</head>
+<body>
+
+<h1>LXMF Messages</h1>
+<div class="stats" id="stats">Loading…</div>
+
+<!-- Compose panel -->
+<div class="panel">
+  <h3>Compose &amp; Send</h3>
+  <div class="row">
+    <div style="flex:2">
+      <label for="cmp-dest">Destination hash (32 hex chars)</label>
+      <input id="cmp-dest" placeholder="e.g. a1b2c3d4e5f6…" maxlength="32" />
+    </div>
+    <div style="flex:1">
+      <label for="cmp-method">Method</label>
+      <select id="cmp-method">
+        <option value="">auto</option>
+        <option value="opportunistic">opportunistic</option>
+        <option value="direct">direct</option>
+        <option value="propagated">propagated</option>
+      </select>
+    </div>
+  </div>
+  <div class="row">
+    <div style="flex:1">
+      <label for="cmp-title">Title</label>
+      <input id="cmp-title" placeholder="optional title" />
+    </div>
+  </div>
+  <div class="row">
+    <div style="flex:1">
+      <label for="cmp-content">Message</label>
+      <textarea id="cmp-content" placeholder="Your message"></textarea>
+    </div>
+  </div>
+  <div class="row" id="cmp-prop-row" style="display:none">
+    <div style="flex:1">
+      <label for="cmp-prop">Propagation node hash</label>
+      <input id="cmp-prop" placeholder="32 hex chars" maxlength="32" />
+    </div>
+  </div>
+  <div class="row" style="align-items:center">
+    <button id="cmp-send">Send</button>
+    <div id="send-status"></div>
+  </div>
+</div>
+
+<h2>Received</h2>
+<button class="btn-refresh" onclick="load()">Refresh</button>
+<div id="messages"><div class="empty">Loading messages…</div></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+async function load() {
+  try {
+    const [msgs, stats] = await Promise.all([
+      fetch('/api/messages').then(r => r.json()),
+      fetch('/api/stats').then(r => r.json()),
+    ]);
+    $('stats').innerHTML =
+      'Uptime: ' + fmt(stats.uptime) +
+      ' | Packets: ' + stats.transport.packetsReceived +
+      ' | Announces: ' + stats.transport.announcesValidated +
+      ' | Paths: ' + stats.transport.paths +
+      (stats.lxmf ? ' | LXMF delivered: ' + stats.lxmf.deliveredMessages : '');
+    const el = $('messages');
+    if (msgs.length === 0) { el.innerHTML = '<div class="empty">No messages yet</div>'; return; }
+    el.innerHTML = msgs.slice().reverse().map(m =>
+      '<div class="msg">' +
+      '<div class="from">From: ' + m.sourceHash.slice(0,16) + '…</div>' +
+      (m.title ? '<div class="title">' + esc(m.title) + '</div>' : '') +
+      '<div class="content">' + esc(m.content) + '</div>' +
+      '<div class="meta">' + new Date(m.timestamp*1000).toLocaleString() +
+      ' | ' + ['','opportunistic','direct','propagated'][m.method||0] +
+      ' | sig: ' + (m.signatureValidated ? 'valid' : 'unverified') + '</div></div>'
+    ).join('');
+  } catch (err) {
+    $('stats').textContent = 'Error: ' + err.message;
+  }
+}
+
+function esc(s) { return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function fmt(s) { const h=Math.floor(s/3600),m=Math.floor(s%3600/60); return h+'h'+m+'m'; }
+
+// Toggle propagation-node field when method = propagated
+$('cmp-method').addEventListener('change', () => {
+  $('cmp-prop-row').style.display = $('cmp-method').value === 'propagated' ? 'flex' : 'none';
+});
+
+// Send button
+$('cmp-send').addEventListener('click', async () => {
+  const dest = $('cmp-dest').value.trim();
+  const title = $('cmp-title').value;
+  const content = $('cmp-content').value;
+  const method = $('cmp-method').value || undefined;
+  const propagationNodeHash = method === 'propagated' ? $('cmp-prop').value.trim() : undefined;
+
+  if (!/^[0-9a-f]{32}$/i.test(dest)) {
+    setStatus('Destination must be 32 hex chars', 'err');
+    return;
+  }
+  if (!content) { setStatus('Message content is empty', 'err'); return; }
+
+  const btn = $('cmp-send');
+  btn.disabled = true;
+  setStatus('Sending…', 'pending');
+
+  try {
+    const res = await fetch('/api/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ destinationHash: dest, title, content, method, propagationNodeHash }),
+    });
+    const body = await res.json();
+    if (!res.ok) {
+      setStatus('Error: ' + (body.error || res.statusText), 'err');
+      btn.disabled = false;
+      return;
+    }
+    setStatus('Queued: ' + body.id.slice(0, 16) + '… (state ' + body.state + ')', 'pending');
+    pollMessage(body.id, btn);
+  } catch (err) {
+    setStatus('Error: ' + err.message, 'err');
+    btn.disabled = false;
+  }
+});
+
+function setStatus(text, cls) {
+  const el = $('send-status');
+  el.textContent = text;
+  el.className = cls || '';
+}
+
+// Poll a pending outbound message until it settles
+async function pollMessage(id, btn) {
+  const STATE = { 0x01:'OUTBOUND', 0x02:'SENDING', 0x04:'SENT', 0x08:'DELIVERED', 0xFF:'FAILED' };
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 1500));
+    try {
+      const res = await fetch('/api/messages/' + id);
+      if (!res.ok) continue;
+      const body = await res.json();
+      const stateName = STATE[body.state] || ('0x' + body.state?.toString(16));
+      setStatus('State: ' + stateName + (body.attempts ? ' (attempt ' + body.attempts + ')' : ''),
+        body.state === 0x08 ? 'ok' : body.state === 0xFF ? 'err' : 'pending');
+      if (body.state === 0x04 || body.state === 0x08 || body.state === 0xFF) break;
+    } catch {}
+  }
+  btn.disabled = false;
+  load();
+}
+
+load();
+setInterval(load, 15000);
+</script>
+</body>
+</html>

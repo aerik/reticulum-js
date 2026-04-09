@@ -116,6 +116,10 @@ export class Link extends EventEmitter {
     this._requestHandlers = new Map();
     this._pendingRequests = new Map();
 
+    // Pending packet proofs — map from hex(packetHash) → { resolve, reject, timer }
+    // Used by sendWithProof() on the initiator side to wait for PROOF of a sent packet.
+    this._pendingProofs = new Map();
+
     // Incoming resource tracking
     this._activeResource = null;
 
@@ -768,6 +772,111 @@ export class Link extends EventEmitter {
   }
 
   /**
+   * Send data on the link and return a Promise that resolves when a packet
+   * proof is received. Matching Python Packet.send() + prove() flow where the
+   * responder calls link.prove_packet() after receiving the data.
+   *
+   * @param {Uint8Array} data - Plaintext data to send
+   * @param {number} [timeoutMs=15000] - Proof wait timeout
+   * @returns {Promise<void>} Resolves on proof, rejects on timeout or link close
+   */
+  async sendWithProof(data, timeoutMs = 15000) {
+    if (this.status !== LINK_ACTIVE) {
+      throw new Error('Link is not active');
+    }
+
+    // Build the packet manually so we can capture its hash before transmit.
+    const encrypted = await this.encrypt(data);
+    const pkt = new Packet();
+    pkt.headerType = HEADER_1;
+    pkt.packetType = PACKET_DATA;
+    pkt.destType = DEST_LINK;
+    pkt.transportType = TRANSPORT_BROADCAST;
+    pkt.destinationHash = this.linkId;
+    pkt.context = CONTEXT_NONE;
+    pkt.data = encrypted;
+    pkt.pack(); // computes packetHash = SHA256(hashable_part)
+
+    const hashHex = toHex(pkt.packetHash);
+
+    const proofPromise = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this._pendingProofs.delete(hashHex);
+        reject(new Error(`Packet proof timeout after ${timeoutMs}ms`));
+      }, timeoutMs);
+
+      this._pendingProofs.set(hashHex, {
+        resolve: () => {
+          clearTimeout(timer);
+          this._pendingProofs.delete(hashHex);
+          resolve();
+        },
+        reject: (err) => {
+          clearTimeout(timer);
+          this._pendingProofs.delete(hashHex);
+          reject(err);
+        },
+      });
+    });
+
+    this._transport.transmit(pkt);
+    this.lastOutbound = Date.now();
+
+    return proofPromise;
+  }
+
+  /**
+   * Handle an inbound packet proof arriving on this link.
+   * Matching Python Link.validate_proof():
+   *   proof_data = packet_hash(32) + Ed25519_sign(packet_hash)(64)
+   * The destination identity's Ed25519 signing public key is used to verify.
+   *
+   * @param {Packet} packet - Incoming PROOF packet with destHash == linkId
+   */
+  _handlePacketProof(packet) {
+    if (!packet.data || packet.data.length < 96) {
+      log(LOG_DEBUG, TAG, `Packet proof too short: ${packet.data?.length || 0}`);
+      return;
+    }
+
+    const packetHash = packet.data.slice(0, 32);
+    const signature = packet.data.slice(32, 96);
+    const hashHex = toHex(packetHash);
+
+    const pending = this._pendingProofs.get(hashHex);
+    if (!pending) {
+      // Not one we're waiting for — harmless, ignore.
+      return;
+    }
+
+    // Verify signature using the destination identity's signing public key.
+    // For the initiator, destination.identity is the remote peer we connected to.
+    const sigPub = this.destination && this.destination.identity
+      ? this.destination.identity.signingPublicKey
+      : null;
+
+    if (!sigPub) {
+      log(LOG_WARNING, TAG, `Cannot verify packet proof: no destination signing key`);
+      pending.reject(new Error('No signing key to verify proof'));
+      return;
+    }
+
+    try {
+      const valid = ed25519Verify(packetHash, signature, sigPub);
+      if (!valid) {
+        log(LOG_WARNING, TAG, `Packet proof signature invalid for ${hashHex.slice(0, 16)}..`);
+        pending.reject(new Error('Invalid packet proof signature'));
+        return;
+      }
+      log(LOG_DEBUG, TAG, `Packet proof verified for ${hashHex.slice(0, 16)}..`);
+      pending.resolve();
+    } catch (err) {
+      log(LOG_WARNING, TAG, `Packet proof verification error: ${err.message}`);
+      pending.reject(err);
+    }
+  }
+
+  /**
    * Send a proof for a received packet.
    * Matching Python Link.prove_packet():
    *   proof_data = packet_hash(32) + Ed25519_sign(packet_hash)(64)
@@ -898,6 +1007,14 @@ export class Link extends EventEmitter {
   _teardown(reason) {
     this._stopWatchdog();
     this.status = LINK_CLOSED;
+
+    // Reject any pending packet-proof waiters so callers unblock
+    if (this._pendingProofs && this._pendingProofs.size > 0) {
+      for (const pending of this._pendingProofs.values()) {
+        try { pending.reject(new Error('Link closed before proof received')); } catch {}
+      }
+      this._pendingProofs.clear();
+    }
 
     // Zero out keys
     this._encPriv = null;
