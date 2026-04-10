@@ -102,6 +102,7 @@ async function main() {
     const { LXMRouter } = await import('../src/lxmf/LXMRouter.js');
     router = new LXMRouter(rns.transport, {
       storagePath: join(dir, 'lxmf'),
+      storage: rns.storage,                  // for persistent outbound queue
       messageExpiry: 30 * 24 * 60 * 60,
     });
 
@@ -112,6 +113,16 @@ async function main() {
 
     // Enable propagation
     router.enablePropagation(rns.identity);
+
+    // Restore any outbound messages persisted from a previous run.
+    try {
+      const restored = await router.loadOutboundQueue();
+      if (restored > 0) {
+        console.log(`  Restored ${restored} pending outbound message(s)`);
+      }
+    } catch (err) {
+      console.error(`  Failed to restore outbound queue: ${err.message}`);
+    }
 
     console.log(`  LXMF: enabled`);
     console.log(`    Delivery:    ${toHex(deliveryDest.hash)}`);

@@ -53,6 +53,9 @@ export class LXMRouter extends EventEmitter {
     super();
     this.transport = transport;
     this.storagePath = options.storagePath || null;
+    // Storage instance (from Reticulum.start) used to persist the outbound
+    // queue across restarts. Optional: when omitted, the queue is RAM-only.
+    this.storage = options.storage || null;
     this.messageExpiry = options.messageExpiry || MESSAGE_EXPIRY;
     this.propagationLimit = (options.propagationLimit || PROPAGATION_LIMIT) * 1000;
 
@@ -371,7 +374,7 @@ export class LXMRouter extends EventEmitter {
       ? toHex(options.propagationNodeHash)
       : destHex;
 
-    this.pendingOutbound.set(msgIdHex, {
+    const entry = {
       message,
       method,
       destHex,
@@ -380,6 +383,14 @@ export class LXMRouter extends EventEmitter {
       sourceIdentity,
       attempts: 0,
       nextAttempt: Date.now(),
+      createdAt: Date.now() / 1000,
+    };
+    this.pendingOutbound.set(msgIdHex, entry);
+
+    // Persist immediately so an rnsd crash before delivery preserves the
+    // message. Best-effort — if storage isn't wired up we just stay in RAM.
+    this._persistEntry(msgIdHex, entry).catch((err) => {
+      log(LOG_WARNING, TAG, `Failed to persist outbound entry: ${err.message}`);
     });
 
     log(LOG_INFO, TAG, `Queued outbound ${msgIdHex.slice(0, 16)}.. ` +
@@ -395,6 +406,110 @@ export class LXMRouter extends EventEmitter {
   }
 
   /**
+   * Write an outbound entry to persistent storage. Best-effort no-op if
+   * `this.storage` was not provided.
+   * @param {string} msgIdHex
+   * @param {object} entry
+   */
+  async _persistEntry(msgIdHex, entry) {
+    if (!this.storage) return;
+    await this.storage.saveOutboundEntry(msgIdHex, {
+      packed: entry.message.packed,
+      method: entry.method,
+      desiredMethod: entry.message.desiredMethod,
+      attempts: entry.attempts,
+      nextAttempt: entry.nextAttempt,
+      propagationNodeHash: entry.method === PROPAGATED ? entry.targetHash : null,
+      sourceHash: entry.message.sourceHash,
+      destinationHash: entry.message.destinationHash,
+      sourceIdentityHash: entry.sourceIdentity ? entry.sourceIdentity.hash : null,
+      createdAt: entry.createdAt,
+    });
+  }
+
+  /**
+   * Remove an outbound entry from persistent storage.
+   * @param {string} msgIdHex
+   */
+  async _unpersistEntry(msgIdHex) {
+    if (!this.storage) return;
+    try {
+      await this.storage.deleteOutboundEntry(msgIdHex);
+    } catch (err) {
+      log(LOG_DEBUG, TAG, `deleteOutboundEntry failed: ${err.message}`);
+    }
+  }
+
+  /**
+   * Restore previously-persisted outbound entries from disk and re-queue them.
+   * Should be called after registerDeliveryIdentity() so that source identity
+   * lookup can succeed. Returns the number of restored entries.
+   *
+   * @returns {Promise<number>}
+   */
+  async loadOutboundQueue() {
+    if (!this.storage) return 0;
+    const entries = await this.storage.loadOutboundEntries();
+    let restored = 0;
+    for (const [msgIdHex, persisted] of entries) {
+      try {
+        // Reconstruct the LXMessage from its packed bytes. We need an identity
+        // lookup function so signature verification can run; the transport's
+        // announce table is the right source.
+        const identityLookup = (h) => this.transport.getIdentity(h);
+        const message = LXMessage.unpackFromBytes(persisted.packed, identityLookup, persisted.method);
+        message.method = persisted.method;
+        message.desiredMethod = persisted.desiredMethod;
+        message.state = OUTBOUND;
+        message.deliveryAttempts = persisted.attempts;
+        message.incoming = false; // outbound, not received
+
+        // Find the matching local source identity by identity hash so the
+        // dispatcher has a private key when needed (e.g. for re-pack on retry).
+        let sourceIdentity = null;
+        if (persisted.sourceIdentityHash) {
+          for (const e of this.deliveryDestinations.values()) {
+            if (e.identity && e.identity.hash &&
+                toHex(e.identity.hash) === toHex(persisted.sourceIdentityHash)) {
+              sourceIdentity = e.identity;
+              break;
+            }
+          }
+        }
+        if (!sourceIdentity) {
+          log(LOG_WARNING, TAG,
+            `Skipping restored outbound ${msgIdHex.slice(0, 16)}.. — source identity not registered`);
+          await this._unpersistEntry(msgIdHex);
+          continue;
+        }
+
+        const destHex = toHex(message.destinationHash);
+        const entry = {
+          message,
+          method: persisted.method,
+          destHex,
+          targetHex: persisted.propagationNodeHash
+            ? toHex(persisted.propagationNodeHash) : destHex,
+          targetHash: persisted.propagationNodeHash || message.destinationHash,
+          sourceIdentity,
+          attempts: persisted.attempts || 0,
+          nextAttempt: Date.now(), // retry immediately on restart
+          createdAt: persisted.createdAt,
+        };
+        this.pendingOutbound.set(msgIdHex, entry);
+        restored++;
+      } catch (err) {
+        log(LOG_WARNING, TAG, `Failed to restore outbound entry ${msgIdHex}: ${err.message}`);
+        await this._unpersistEntry(msgIdHex);
+      }
+    }
+    if (restored > 0) {
+      log(LOG_INFO, TAG, `Restored ${restored} pending outbound LXMF message(s) from disk`);
+    }
+    return restored;
+  }
+
+  /**
    * Periodic outbound processor — retries pending messages and expires failures.
    */
   _processOutbound() {
@@ -402,10 +517,12 @@ export class LXMRouter extends EventEmitter {
     for (const [msgIdHex, entry] of this.pendingOutbound) {
       if (entry.message.state === SENT || entry.message.state === DELIVERED) {
         this.pendingOutbound.delete(msgIdHex);
+        this._unpersistEntry(msgIdHex).catch(() => {});
         continue;
       }
       if (entry.message.state === FAILED) {
         this.pendingOutbound.delete(msgIdHex);
+        this._unpersistEntry(msgIdHex).catch(() => {});
         continue;
       }
       if (entry.message.state === SENDING) {
@@ -441,6 +558,9 @@ export class LXMRouter extends EventEmitter {
     if (!entry) return;
     entry.attempts += 1;
     entry.message.deliveryAttempts = entry.attempts;
+    // Persist the bumped attempt count so a restart between retries doesn't
+    // reset progress.
+    this._persistEntry(msgIdHex, entry).catch(() => {});
 
     switch (entry.method) {
       case OPPORTUNISTIC: return this._sendOpportunistic(entry);
@@ -511,6 +631,7 @@ export class LXMRouter extends EventEmitter {
     }
     this.emit('outbound', message);
     this.pendingOutbound.delete(msgIdHex);
+    this._unpersistEntry(msgIdHex).catch(() => {});
   }
 
   /**
@@ -628,10 +749,12 @@ export class LXMRouter extends EventEmitter {
         }
         this.emit('outbound', entry.message);
         this.pendingOutbound.delete(msgIdHex);
+        this._unpersistEntry(msgIdHex).catch(() => {});
       } catch (err) {
         log(LOG_WARNING, TAG, `Direct send failed for ${msgIdHex.slice(0, 16)}..: ${err.message}`);
         entry.message.state = OUTBOUND;
         entry.nextAttempt = Date.now() + this.DELIVERY_RETRY_WAIT;
+        this._persistEntry(msgIdHex, entry).catch(() => {});
       }
     }
   }
@@ -777,10 +900,12 @@ export class LXMRouter extends EventEmitter {
         }
         this.emit('outbound', entry.message);
         this.pendingOutbound.delete(msgIdHex);
+        this._unpersistEntry(msgIdHex).catch(() => {});
       } catch (err) {
         log(LOG_WARNING, TAG, `Propagated send failed for ${msgIdHex.slice(0, 16)}..: ${err.message}`);
         entry.message.state = OUTBOUND;
         entry.nextAttempt = Date.now() + this.DELIVERY_RETRY_WAIT;
+        this._persistEntry(msgIdHex, entry).catch(() => {});
       }
     }
   }
@@ -802,6 +927,7 @@ export class LXMRouter extends EventEmitter {
     }
     this.emit('outbound', entry.message);
     this.pendingOutbound.delete(msgIdHex);
+    this._unpersistEntry(msgIdHex).catch(() => {});
   }
 
   /**

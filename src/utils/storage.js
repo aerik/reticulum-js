@@ -194,6 +194,89 @@ export class Storage {
     return result;
   }
 
+  // --- LXMF Outbound Queue ---
+
+  /**
+   * Save an outbound LXMF entry. Used by LXMRouter to persist its
+   * pendingOutbound map across rnsd restarts.
+   *
+   * @param {string} msgIdHex - Hex of the LXMessage hash (32 bytes → 64 chars)
+   * @param {object} entry - { packed, method, desiredMethod, attempts,
+   *                            nextAttempt, propagationNodeHash, sourceHash,
+   *                            destinationHash, sourceIdentityHash }
+   */
+  async saveOutboundEntry(msgIdHex, entry) {
+    const key = `storage/lxmf/outbound/${msgIdHex}`;
+    const packed = new Uint8Array(msgpackEncode({
+      packed: Array.from(entry.packed),
+      method: entry.method || 0,
+      desiredMethod: entry.desiredMethod || 0,
+      attempts: entry.attempts || 0,
+      nextAttempt: entry.nextAttempt || 0,
+      propagationNodeHash: entry.propagationNodeHash
+        ? Array.from(entry.propagationNodeHash) : null,
+      sourceHash: entry.sourceHash ? Array.from(entry.sourceHash) : null,
+      destinationHash: entry.destinationHash ? Array.from(entry.destinationHash) : null,
+      sourceIdentityHash: entry.sourceIdentityHash
+        ? Array.from(entry.sourceIdentityHash) : null,
+      createdAt: entry.createdAt || Date.now() / 1000,
+    }));
+    await this.backend.set(key, packed);
+  }
+
+  /**
+   * Delete an outbound entry (after successful delivery or terminal failure).
+   * @param {string} msgIdHex
+   */
+  async deleteOutboundEntry(msgIdHex) {
+    const key = `storage/lxmf/outbound/${msgIdHex}`;
+    await this.backend.delete(key);
+  }
+
+  /**
+   * Load all persisted outbound entries.
+   * @returns {Promise<Map<string, object>>} msgIdHex → entry
+   */
+  async loadOutboundEntries() {
+    const result = new Map();
+    const prefix = 'storage/lxmf/outbound/';
+    let keys;
+    try {
+      keys = await this.backend.list(prefix);
+    } catch {
+      return result;
+    }
+    for (const key of keys) {
+      const msgIdHex = key.slice(prefix.length);
+      const data = await this.backend.get(key);
+      if (!data) continue;
+      try {
+        const decoded = msgpackDecode(data);
+        result.set(msgIdHex, {
+          packed: new Uint8Array(decoded.packed),
+          method: decoded.method,
+          desiredMethod: decoded.desiredMethod,
+          attempts: decoded.attempts,
+          nextAttempt: decoded.nextAttempt,
+          propagationNodeHash: decoded.propagationNodeHash
+            ? new Uint8Array(decoded.propagationNodeHash) : null,
+          sourceHash: decoded.sourceHash ? new Uint8Array(decoded.sourceHash) : null,
+          destinationHash: decoded.destinationHash
+            ? new Uint8Array(decoded.destinationHash) : null,
+          sourceIdentityHash: decoded.sourceIdentityHash
+            ? new Uint8Array(decoded.sourceIdentityHash) : null,
+          createdAt: decoded.createdAt,
+        });
+      } catch (err) {
+        log(LOG_WARNING, TAG, `Failed to parse outbound entry ${msgIdHex}: ${err.message}`);
+      }
+    }
+    if (result.size > 0) {
+      log(LOG_DEBUG, TAG, `Loaded ${result.size} pending outbound LXMF entries`);
+    }
+    return result;
+  }
+
   // --- Announce Cache ---
 
   async cacheAnnounce(packetHash, raw, interfaceName) {
