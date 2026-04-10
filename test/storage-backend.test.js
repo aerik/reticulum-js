@@ -169,7 +169,7 @@ describe('Storage with MemoryBackend', () => {
     expect(await storage.loadTransportIdentity()).toBeNull();
     expect(await storage.loadIdentity('nope')).toBeNull();
     expect((await storage.loadKnownDestinations()).size).toBe(0);
-    expect(await storage.loadPathTable()).toEqual([]);
+    expect((await storage.loadPathTable()).size).toBe(0);
     expect((await storage.loadHashlist()).size).toBe(0);
     expect(await storage.loadCachedAnnounce(randomBytes(32))).toBeNull();
   });

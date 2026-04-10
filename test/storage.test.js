@@ -105,9 +105,33 @@ describe('Storage', () => {
       await storage.savePathTable(table);
 
       const loaded = await storage.loadPathTable();
-      expect(loaded).toHaveLength(1);
-      expect(loaded[0][0]).toBe('deadbeef' + '00'.repeat(12));
-      expect(loaded[0][3]).toBe(3); // hops
+      expect(loaded.size).toBe(1);
+      const key = 'deadbeef' + '00'.repeat(12);
+      const entry = loaded.get(key);
+      expect(entry).toBeDefined();
+      expect(entry.hops).toBe(3);
+      expect(entry.timestamp).toBeTypeOf('number');
+      expect(entry.nextHop).toBeInstanceOf(Uint8Array);
+    });
+
+    it('skips malformed entries on save without throwing', async () => {
+      const table = new Map();
+      // A valid entry plus several malformed ones (the kind of garbage that
+      // could leak in from a buggy load round-trip)
+      table.set('aabbcc' + '00'.repeat(13), {
+        timestamp: Date.now() / 1000,
+        nextHop: new Uint8Array(16),
+        hops: 1,
+        expires: Date.now() / 1000 + 60,
+      });
+      table.set('11' + '00'.repeat(15), null);          // null entry
+      table.set('22' + '00'.repeat(15), 12345);         // primitive
+      table.set('33' + '00'.repeat(15), { hops: 2 });   // missing timestamp
+
+      await expect(storage.savePathTable(table)).resolves.not.toThrow();
+
+      const loaded = await storage.loadPathTable();
+      expect(loaded.size).toBe(1); // only the valid entry survived
     });
   });
 

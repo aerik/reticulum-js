@@ -59,20 +59,25 @@ describe('Resource', () => {
   describe('ResourceSender', () => {
     it('segments data correctly', async () => {
       const { initiatorLink } = await setupLinkedPair();
-      const data = randomBytes(1000); // > 431 sdu, so 3 parts
+      const data = randomBytes(1000);
       const sender = new ResourceSender(initiatorLink, data);
+      await sender._prepareParts();
 
-      expect(sender.totalParts).toBe(Math.ceil((1000 + 4) / 431)); // +4 for random hash prefix
+      // Stream is encrypted (4-byte prefix + 1000 bytes data, then AES-CBC
+      // padded to 16-byte block + 16-byte IV + 32-byte HMAC + 32-byte ephemeral
+      // pub) → ~1100 bytes on the wire, split into 431-byte SDUs.
       expect(sender.parts.length).toBe(sender.totalParts);
       expect(sender.mapHashes.length).toBe(sender.totalParts);
       expect(sender.hash).toHaveLength(32);
       expect(sender.randomHash).toHaveLength(4);
+      expect(sender.streamData.length).toBeGreaterThan(data.length);
     });
 
     it('handles small data (single part)', async () => {
       const { initiatorLink } = await setupLinkedPair();
       const data = fromUtf8('small');
       const sender = new ResourceSender(initiatorLink, data);
+      await sender._prepareParts();
 
       expect(sender.totalParts).toBe(1);
     });
@@ -114,7 +119,8 @@ describe('Resource', () => {
     it('transfers data and verifies with proof', async () => {
       const { initiatorLink, responderLink } = await setupLinkedPair();
       const data = randomBytes(1500); // multiple parts
-      const sender = new ResourceSender(initiatorLink, data);
+      const sender = new ResourceSender(initiatorLink, data, { encrypted: false });
+      await sender._prepareParts();
 
       // Simulate: sender creates advertisement, receiver parses it
       const { encode: msgpackEncode } = await import('@msgpack/msgpack');
@@ -123,7 +129,7 @@ describe('Resource', () => {
         hashmap.set(sender.mapHashes[i], i * 4);
       }
       const adv = msgpackEncode({
-        t: sender.transferData.length,
+        t: sender.streamData.length,
         d: sender.originalData.length,
         n: sender.totalParts,
         h: sender.hash,
@@ -153,7 +159,8 @@ describe('Resource', () => {
     it('transfers small data (single part)', async () => {
       const { initiatorLink, responderLink } = await setupLinkedPair();
       const data = fromUtf8('Hello from Node.js RNS!');
-      const sender = new ResourceSender(initiatorLink, data);
+      const sender = new ResourceSender(initiatorLink, data, { encrypted: false });
+      await sender._prepareParts();
 
       const { encode: msgpackEncode } = await import('@msgpack/msgpack');
       const hashmap = new Uint8Array(sender.mapHashes.length * 4);
@@ -161,7 +168,7 @@ describe('Resource', () => {
         hashmap.set(sender.mapHashes[i], i * 4);
       }
       const adv = msgpackEncode({
-        t: sender.transferData.length, d: data.length,
+        t: sender.streamData.length, d: data.length,
         n: sender.totalParts, h: sender.hash, r: sender.randomHash,
         o: sender.hash, i: 1, l: 1, q: null, f: 0x00,
         m: hashmap,
@@ -181,7 +188,8 @@ describe('Resource', () => {
     it('handles out-of-order part delivery', async () => {
       const { initiatorLink, responderLink } = await setupLinkedPair();
       const data = randomBytes(2000); // ~5 parts
-      const sender = new ResourceSender(initiatorLink, data);
+      const sender = new ResourceSender(initiatorLink, data, { encrypted: false });
+      await sender._prepareParts();
 
       const { encode: msgpackEncode } = await import('@msgpack/msgpack');
       const hashmap = new Uint8Array(sender.mapHashes.length * 4);
@@ -189,7 +197,7 @@ describe('Resource', () => {
         hashmap.set(sender.mapHashes[i], i * 4);
       }
       const adv = msgpackEncode({
-        t: sender.transferData.length, d: data.length,
+        t: sender.streamData.length, d: data.length,
         n: sender.totalParts, h: sender.hash, r: sender.randomHash,
         o: sender.hash, i: 1, l: 1, q: null, f: 0x00,
         m: hashmap,
@@ -210,7 +218,8 @@ describe('Resource', () => {
     it('rejects tampered data', async () => {
       const { initiatorLink, responderLink } = await setupLinkedPair();
       const data = randomBytes(500);
-      const sender = new ResourceSender(initiatorLink, data);
+      const sender = new ResourceSender(initiatorLink, data, { encrypted: false });
+      await sender._prepareParts();
 
       const { encode: msgpackEncode } = await import('@msgpack/msgpack');
       const hashmap = new Uint8Array(sender.mapHashes.length * 4);
@@ -218,7 +227,7 @@ describe('Resource', () => {
         hashmap.set(sender.mapHashes[i], i * 4);
       }
       const adv = msgpackEncode({
-        t: sender.transferData.length, d: data.length,
+        t: sender.streamData.length, d: data.length,
         n: sender.totalParts, h: sender.hash, r: sender.randomHash,
         o: sender.hash, i: 1, l: 1, q: null, f: 0x00,
         m: hashmap,
@@ -243,7 +252,8 @@ describe('Resource', () => {
     it('tracks progress', async () => {
       const { initiatorLink, responderLink } = await setupLinkedPair();
       const data = randomBytes(2000);
-      const sender = new ResourceSender(initiatorLink, data);
+      const sender = new ResourceSender(initiatorLink, data, { encrypted: false });
+      await sender._prepareParts();
 
       const { encode: msgpackEncode } = await import('@msgpack/msgpack');
       const hashmap = new Uint8Array(sender.mapHashes.length * 4);
@@ -251,7 +261,7 @@ describe('Resource', () => {
         hashmap.set(sender.mapHashes[i], i * 4);
       }
       const adv = msgpackEncode({
-        t: sender.transferData.length, d: data.length,
+        t: sender.streamData.length, d: data.length,
         n: sender.totalParts, h: sender.hash, r: sender.randomHash,
         o: sender.hash, i: 1, l: 1, q: null, f: 0x00,
         m: hashmap,

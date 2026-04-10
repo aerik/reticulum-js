@@ -88,43 +88,44 @@ export class ResourceSender {
    * @param {Uint8Array} data - Data to send
    * @param {object} [options]
    * @param {Uint8Array} [options.requestId] - Attach to a request
+   * @param {boolean} [options.encrypted=true] - Encrypt the stream over the link
    */
   constructor(link, data, options = {}) {
     this.link = link;
     this.originalData = data;
     this.requestId = options.requestId || null;
+    this.encryptedFlag = options.encrypted !== false;
     this.status = RESOURCE_NONE;
 
-    // Random hash for part identification
+    // Random hash used for the outer resource hash + map_hash computation.
+    // Matches Python `self.random_hash` (separate from the inner data prefix).
     this.randomHash = randomBytes(RANDOM_HASH_SIZE);
 
-    // Resource hash = SHA256(data + random_hash)
+    // Resource hash = SHA256(original_data + random_hash). Computed on the
+    // PLAINTEXT original data (matches Python's `full_hash(data+random_hash)`).
     this.hash = sha256Hash(concat(data, this.randomHash));
 
-    // Prepare transfer data: random_hash prefix + data
-    this.transferData = concat(this.randomHash, data);
+    // Expected proof = SHA256(original_data + resource_hash). Also plaintext.
+    this.expectedProof = sha256Hash(concat(data, this.hash));
+
+    // Inner random-hash prefix that goes inside the encrypted stream. The
+    // receiver strips this after decryption (Python uses a different random
+    // value for the prefix vs the outer hash; we match by generating a fresh
+    // one here).
+    const innerPrefix = randomBytes(RANDOM_HASH_SIZE);
+    this.transferData = concat(innerPrefix, data);
 
     // Derive SDU from link MTU (matching Python: link.mtu - 36)
     this.sdu = (link.mtu || MTU) - SDU_OVERHEAD;
 
-    // Segment the transfer data
-    this.totalParts = Math.ceil(this.transferData.length / this.sdu);
+    // Parts and hashmap are populated lazily in advertise() because we need
+    // an async link.encrypt() call when encryption is enabled.
+    this.totalParts = 0;
     this.parts = [];
     this.mapHashes = [];
-    this.hashmapRaw = new Uint8Array(this.totalParts * MAPHASH_LEN);
-
-    for (let i = 0; i < this.totalParts; i++) {
-      const start = i * this.sdu;
-      const end = Math.min(start + this.sdu, this.transferData.length);
-      const part = this.transferData.slice(start, end);
-      this.parts.push(part);
-      const mapHash = computeMapHash(part, this.randomHash);
-      this.mapHashes.push(mapHash);
-      this.hashmapRaw.set(mapHash, i * MAPHASH_LEN);
-    }
-
-    // Expected proof
-    this.expectedProof = sha256Hash(concat(data, this.hash));
+    this.hashmapRaw = new Uint8Array(0);
+    this.streamData = null; // either plaintext or encrypted stream
+    this._prepared = false;
 
     this.sentParts = 0;
     this.progress = 0;
@@ -133,20 +134,56 @@ export class ResourceSender {
   }
 
   /**
+   * Prepare the stream (encrypt if needed) and chunk it into parts.
+   * Computes map hashes on the on-the-wire bytes (encrypted if applicable).
+   *
+   * Matches Python Resource.__init__ post-encryption flow.
+   */
+  async _prepareParts() {
+    if (this._prepared) return;
+
+    // Encrypt the entire stream once (matches Python's
+    // `self.data = self.link.encrypt(self.data)`).
+    if (this.encryptedFlag) {
+      this.streamData = await this.link.encrypt(this.transferData);
+    } else {
+      this.streamData = this.transferData;
+    }
+
+    this.totalParts = Math.ceil(this.streamData.length / this.sdu);
+    this.parts = [];
+    this.mapHashes = [];
+    this.hashmapRaw = new Uint8Array(this.totalParts * MAPHASH_LEN);
+
+    for (let i = 0; i < this.totalParts; i++) {
+      const start = i * this.sdu;
+      const end = Math.min(start + this.sdu, this.streamData.length);
+      const part = this.streamData.slice(start, end);
+      this.parts.push(part);
+      const mapHash = computeMapHash(part, this.randomHash);
+      this.mapHashes.push(mapHash);
+      this.hashmapRaw.set(mapHash, i * MAPHASH_LEN);
+    }
+
+    this._prepared = true;
+  }
+
+  /**
    * Start the transfer by sending the advertisement.
    */
   async advertise() {
+    await this._prepareParts();
     this.status = RESOURCE_ADVERTISING;
 
     // Build initial hashmap (first HASHMAP_MAX_LEN entries, segment 0)
     const initialMapCount = Math.min(this.totalParts, HASHMAP_MAX_LEN);
     const hashmap = this.hashmapRaw.slice(0, initialMapCount * MAPHASH_LEN);
 
-    const flags = FLAG_ENCRYPTED; // always encrypted over links
+    const flags = this.encryptedFlag ? FLAG_ENCRYPTED : 0;
 
     const adv = {
-      t: this.transferData.length,
-      d: this.originalData.length,
+      t: this.streamData.length,         // on-wire transfer size (post-encryption)
+      d: this.originalData.length,        // logical (plaintext) data size
       n: this.totalParts,
       h: this.hash,
       r: this.randomHash,
@@ -161,7 +198,9 @@ export class ResourceSender {
     const packed = new Uint8Array(msgpackEncode(adv));
     await this.link.send(packed, CONTEXT_RESOURCE_ADV);
 
-    log(LOG_INFO, TAG, `Advertised resource: ${this.totalParts} parts, ${this.originalData.length} bytes`);
+    log(LOG_INFO, TAG,
+      `Advertised resource: ${this.totalParts} parts, ` +
+      `${this.originalData.length}b plaintext / ${this.streamData.length}b on-wire`);
   }
 
   /**
@@ -199,12 +238,14 @@ export class ResourceSender {
       offset += MAPHASH_LEN;
     }
 
-    // Send requested parts
+    // Send requested parts. RESOURCE-context packets are NOT encrypted at the
+    // link layer (matches Python Packet.pack: "A resource takes care of
+    // encryption by itself"). Use sendRaw to skip the link.encrypt step.
     for (const reqHash of requestedHashes) {
       // Find which part this hash corresponds to
       for (let i = 0; i < this.mapHashes.length; i++) {
         if (equal(this.mapHashes[i], reqHash)) {
-          await this.link.send(this.parts[i], CONTEXT_RESOURCE);
+          this.link.sendRaw(this.parts[i], CONTEXT_RESOURCE);
           this.sentParts++;
           this.progress = this.sentParts / this.totalParts;
           if (this._onProgress) this._onProgress(this.progress);
@@ -590,10 +631,12 @@ export class ResourceReceiver {
 
   /**
    * Send proof to the sender.
+   * Resource proofs are sent as PROOF packets without per-packet encryption
+   * (Python Packet.pack: "Resource proofs are not encrypted").
    */
   async sendProof() {
     const proof = this.generateProof();
-    await this.link.send(proof, CONTEXT_RESOURCE_PRF);
+    this.link.sendRaw(proof, CONTEXT_RESOURCE_PRF, PACKET_PROOF);
     log(LOG_DEBUG, TAG, 'Sent resource proof');
   }
 

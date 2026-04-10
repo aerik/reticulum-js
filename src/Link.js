@@ -33,7 +33,7 @@ import {
 } from './utils/crypto.js';
 import { concat, toHex, equal, randomBytes } from './utils/bytes.js';
 import { Packet } from './Packet.js';
-import { ResourceReceiver } from './Resource.js';
+import { ResourceReceiver, ResourceSender, RESOURCE_COMPLETE, RESOURCE_FAILED } from './Resource.js';
 import { log, LOG_DEBUG, LOG_INFO, LOG_WARNING, LOG_VERBOSE } from './utils/log.js';
 import { encode as msgpackEncode, decode as msgpackDecode } from '@msgpack/msgpack';
 import {
@@ -44,6 +44,7 @@ import {
   CONTEXT_NONE, CONTEXT_LRPROOF, CONTEXT_LRRTT,
   CONTEXT_KEEPALIVE, CONTEXT_LINKCLOSE, CONTEXT_LINKPROOF,
   CONTEXT_REQUEST, CONTEXT_RESPONSE,
+  CONTEXT_RESOURCE_PRF,
   IDENTITY_HASH_LENGTH,
   IDENTITY_DERIVED_KEY_LENGTH,
 } from './constants.js';
@@ -119,6 +120,11 @@ export class Link extends EventEmitter {
     // Pending packet proofs — map from hex(packetHash) → { resolve, reject, timer }
     // Used by sendWithProof() on the initiator side to wait for PROOF of a sent packet.
     this._pendingProofs = new Map();
+
+    // Outgoing resources keyed by hex(resource.hash). Each entry tracks a
+    // ResourceSender that's been advertised on this link. We dispatch
+    // RESOURCE_REQ and RESOURCE_PRF inbound packets to the matching sender.
+    this._outgoingResources = new Map();
 
     // Incoming resource tracking
     this._activeResource = null;
@@ -387,6 +393,34 @@ export class Link extends EventEmitter {
     pkt.destinationHash = this.linkId;
     pkt.context = context;
     pkt.data = encrypted;
+    this._transport.transmit(pkt);
+    this.lastOutbound = Date.now();
+  }
+
+  /**
+   * Send data over the link WITHOUT per-packet encryption.
+   *
+   * Used for resource parts (CONTEXT_RESOURCE) and resource proofs
+   * (CONTEXT_RESOURCE_PRF) — Python's Packet.pack() skips encryption for
+   * these contexts because the Resource encrypts its own stream and the
+   * proof is a hash. We must match that on the wire.
+   *
+   * @param {Uint8Array} data
+   * @param {number} context
+   * @param {number} [packetType=PACKET_DATA] - PACKET_DATA or PACKET_PROOF
+   */
+  sendRaw(data, context, packetType = PACKET_DATA) {
+    if (this.status !== LINK_ACTIVE) {
+      throw new Error('Link is not active');
+    }
+    const pkt = new Packet();
+    pkt.headerType = HEADER_1;
+    pkt.packetType = packetType;
+    pkt.destType = DEST_LINK;
+    pkt.transportType = TRANSPORT_BROADCAST;
+    pkt.destinationHash = this.linkId;
+    pkt.context = context;
+    pkt.data = data;
 
     this._transport.transmit(pkt);
     this.lastOutbound = Date.now();
@@ -826,14 +860,25 @@ export class Link extends EventEmitter {
   }
 
   /**
-   * Handle an inbound packet proof arriving on this link.
-   * Matching Python Link.validate_proof():
-   *   proof_data = packet_hash(32) + Ed25519_sign(packet_hash)(64)
-   * The destination identity's Ed25519 signing public key is used to verify.
+   * Handle an inbound proof packet arriving on this link.
+   *
+   * Routes by context:
+   *   - CONTEXT_RESOURCE_PRF → resource transfer proof (64 bytes:
+   *     resource_hash + sha256(data + resource_hash))
+   *   - default → packet proof for sendWithProof() (96 bytes:
+   *     packet_hash + Ed25519_sign(packet_hash))
    *
    * @param {Packet} packet - Incoming PROOF packet with destHash == linkId
    */
   _handlePacketProof(packet) {
+    // Resource proofs use the RESOURCE_PRF context and are 64 bytes (no
+    // signature — verified by hash chain). Dispatch them to the resource
+    // sender directly.
+    if (packet.context === CONTEXT_RESOURCE_PRF) {
+      this._handleResourceProof(packet.data);
+      return;
+    }
+
     if (!packet.data || packet.data.length < 96) {
       log(LOG_DEBUG, TAG, `Packet proof too short: ${packet.data?.length || 0}`);
       return;
@@ -874,6 +919,114 @@ export class Link extends EventEmitter {
     } catch (err) {
       log(LOG_WARNING, TAG, `Packet proof verification error: ${err.message}`);
       pending.reject(err);
+    }
+  }
+
+  /**
+   * Send data as a Resource over this link, for messages too large to fit in
+   * a single link packet. Mirrors Python's `RNS.Resource(data, link, ...)`
+   * constructor flow.
+   *
+   * Internally creates a `ResourceSender`, registers it in
+   * `_outgoingResources` so inbound RESOURCE_REQ / RESOURCE_PRF packets can
+   * be routed to it, calls `advertise()` to start the transfer, and returns a
+   * Promise that resolves with the byte count when the receiver sends a
+   * verified proof, or rejects on link close / failure.
+   *
+   * @param {Uint8Array} data - The full payload to send
+   * @param {object} [options]
+   * @param {number} [options.timeoutMs=120000] - Max time to wait for proof
+   * @param {function(number)} [options.onProgress] - Called with [0..1]
+   * @returns {Promise<number>} Resolves with bytes sent on success
+   */
+  async sendResource(data, options = {}) {
+    if (this.status !== LINK_ACTIVE) {
+      throw new Error('Link is not active');
+    }
+
+    const sender = new ResourceSender(this, data);
+    const hashHex = toHex(sender.hash);
+    const timeoutMs = options.timeoutMs || 120_000;
+
+    if (options.onProgress) sender.onProgress(options.onProgress);
+
+    // Make sure we're listening for 'resource_req' / 'resource_proof' events
+    // dispatched from Transport when the corresponding context arrives.
+    if (!this._resourceListenersAttached) {
+      this._resourceListenersAttached = true;
+      this.on('resource_req', (plaintext) => this._handleResourceReq(plaintext));
+      this.on('resource_proof', (proofData) => this._handleResourceProof(proofData));
+    }
+
+    const transferPromise = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this._outgoingResources.delete(hashHex);
+        reject(new Error(`Resource transfer timeout after ${timeoutMs}ms`));
+      }, timeoutMs);
+
+      sender.onComplete(() => {
+        clearTimeout(timer);
+        this._outgoingResources.delete(hashHex);
+        resolve(data.length);
+      });
+
+      // Stash a rejector so _teardown / unrelated failures can wake us up
+      this._outgoingResources.set(hashHex, {
+        sender,
+        reject: (err) => {
+          clearTimeout(timer);
+          this._outgoingResources.delete(hashHex);
+          reject(err);
+        },
+      });
+    });
+
+    log(LOG_INFO, TAG, `Advertising outgoing resource ${hashHex.slice(0, 16)}.. (${data.length}b, ${sender.totalParts} parts)`);
+    await sender.advertise();
+
+    return transferPromise;
+  }
+
+  /**
+   * Dispatch an inbound RESOURCE_REQ to the appropriate outgoing ResourceSender.
+   * Called from Transport when CONTEXT_RESOURCE_REQ is decrypted on this link.
+   * @param {Uint8Array} plaintext
+   */
+  _handleResourceReq(plaintext) {
+    // Request format: flag(1) [+ last_map_hash(4)] + resource_hash(32) + requested_hashes(4*N)
+    let offset = 1;
+    if (plaintext[0] !== 0x00) offset += 4;
+    if (plaintext.length < offset + 32) return;
+
+    const resourceHash = plaintext.slice(offset, offset + 32);
+    const hashHex = toHex(resourceHash);
+    const entry = this._outgoingResources.get(hashHex);
+    if (!entry) {
+      log(LOG_DEBUG, TAG, `RESOURCE_REQ for unknown resource ${hashHex.slice(0, 16)}..`);
+      return;
+    }
+    entry.sender.handleRequest(plaintext).catch((err) => {
+      log(LOG_WARNING, TAG, `Resource request handling error: ${err.message}`);
+    });
+  }
+
+  /**
+   * Dispatch an inbound RESOURCE_PRF to the appropriate outgoing ResourceSender.
+   * @param {Uint8Array} proofData - 64 bytes: resource_hash(32) + proof_hash(32)
+   */
+  _handleResourceProof(proofData) {
+    if (proofData.length < 64) return;
+    const resourceHash = proofData.slice(0, 32);
+    const hashHex = toHex(resourceHash);
+    const entry = this._outgoingResources.get(hashHex);
+    if (!entry) {
+      log(LOG_DEBUG, TAG, `RESOURCE_PRF for unknown resource ${hashHex.slice(0, 16)}..`);
+      return;
+    }
+    const ok = entry.sender.handleProof(proofData);
+    if (!ok) {
+      log(LOG_WARNING, TAG, `Invalid resource proof for ${hashHex.slice(0, 16)}..`);
+      entry.reject(new Error('Invalid resource proof'));
     }
   }
 
@@ -1015,6 +1168,14 @@ export class Link extends EventEmitter {
         try { pending.reject(new Error('Link closed before proof received')); } catch {}
       }
       this._pendingProofs.clear();
+    }
+
+    // Reject any in-flight outgoing resources
+    if (this._outgoingResources && this._outgoingResources.size > 0) {
+      for (const entry of this._outgoingResources.values()) {
+        try { entry.reject(new Error('Link closed during resource transfer')); } catch {}
+      }
+      this._outgoingResources.clear();
     }
 
     // Zero out keys

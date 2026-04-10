@@ -583,6 +583,10 @@ export class LXMRouter extends EventEmitter {
 
   /**
    * Flush any pending DIRECT messages over an open link.
+   * Uses sendWithProof for messages that fit in a single link packet, and
+   * sendResource for larger ones (matching Python's PACKET vs RESOURCE
+   * representation choice in LXMessage.pack).
+   *
    * @param {string} destHex
    */
   async _drainDirectQueue(destHex) {
@@ -597,8 +601,24 @@ export class LXMRouter extends EventEmitter {
       entry.message.state = SENDING;
       linkEntry.lastActive = Date.now();
 
+      // LINK_PACKET_MAX_CONTENT in Python is link.MDU - LXMF_OVERHEAD ≈ 327
+      // bytes. We compare against the *packed* LXMF size (which already
+      // includes the LXMF header), so use link.MDU directly. Anything larger
+      // goes over a Resource.
+      const linkMdu = linkEntry.link.mtu ? linkEntry.link.mtu - 73 : 320;
+      const useResource = entry.message.packed.length > linkMdu;
+
       try {
-        await linkEntry.link.sendWithProof(entry.message.packed);
+        if (useResource) {
+          log(LOG_INFO, TAG,
+            `Direct sending ${msgIdHex.slice(0, 16)}.. as Resource ` +
+            `(${entry.message.packed.length}b > ${linkMdu})`);
+          await linkEntry.link.sendResource(entry.message.packed, {
+            onProgress: (p) => { entry.message.progress = p; },
+          });
+        } else {
+          await linkEntry.link.sendWithProof(entry.message.packed);
+        }
         entry.message.state = DELIVERED;
         log(LOG_INFO, TAG, `Direct delivered ${msgIdHex.slice(0, 16)}.. → ${destHex.slice(0, 16)}..`);
         if (entry.message.deliveryCallback) {
@@ -734,9 +754,20 @@ export class LXMRouter extends EventEmitter {
         // on the receiving side and calls prove_packet there). We therefore
         // send with proof just like DIRECT, but treat a proof timeout as SENT
         // rather than FAILED, since some servers do not prove every packet.
-        await linkEntry.link.sendWithProof(payload, 10_000).catch((err) => {
-          log(LOG_DEBUG, TAG, `Propagation proof wait: ${err.message} — marking SENT`);
-        });
+        // Use Resource for envelopes too large for a single link packet.
+        const linkMdu = linkEntry.link.mtu ? linkEntry.link.mtu - 73 : 320;
+        if (payload.length > linkMdu) {
+          log(LOG_INFO, TAG,
+            `Propagating ${msgIdHex.slice(0, 16)}.. as Resource ` +
+            `(${payload.length}b > ${linkMdu})`);
+          await linkEntry.link.sendResource(payload, {
+            onProgress: (p) => { entry.message.progress = p; },
+          });
+        } else {
+          await linkEntry.link.sendWithProof(payload, 10_000).catch((err) => {
+            log(LOG_DEBUG, TAG, `Propagation proof wait: ${err.message} — marking SENT`);
+          });
+        }
         entry.message.state = DELIVERED;
         log(LOG_INFO, TAG, `Propagated ${msgIdHex.slice(0, 16)}.. via ${linkKey}`);
         if (entry.message.deliveryCallback) {

@@ -83,7 +83,13 @@ export class Storage {
 
   async saveKnownDestinations(announceTable) {
     const dict = {};
+    let skipped = 0;
     for (const [hexHash, entry] of announceTable) {
+      // Defensive: skip malformed entries (null, missing identity, etc.)
+      if (!entry || !entry.identity || !entry.identity.publicKey) {
+        skipped++;
+        continue;
+      }
       dict[hexHash] = [
         entry.timestamp,
         null,
@@ -93,7 +99,9 @@ export class Storage {
     }
     const packed = new Uint8Array(msgpackEncode(dict));
     await this.backend.set('storage/known_destinations', packed);
-    log(LOG_DEBUG, TAG, `Saved ${announceTable.size} known destinations`);
+    log(LOG_DEBUG, TAG,
+      `Saved ${announceTable.size - skipped} known destinations` +
+      (skipped ? ` (skipped ${skipped} malformed)` : ''));
   }
 
   async loadKnownDestinations() {
@@ -125,7 +133,13 @@ export class Storage {
 
   async savePathTable(pathTable) {
     const entries = [];
+    let skipped = 0;
     for (const [hexHash, entry] of pathTable) {
+      // Defensive: skip malformed entries (null, primitives, missing fields)
+      if (!entry || typeof entry !== 'object' || entry.timestamp == null) {
+        skipped++;
+        continue;
+      }
       entries.push([
         hexHash,
         entry.timestamp,
@@ -139,20 +153,45 @@ export class Storage {
     }
     const packed = new Uint8Array(msgpackEncode(entries));
     await this.backend.set('storage/destination_table', packed);
-    log(LOG_DEBUG, TAG, `Saved ${pathTable.size} path table entries`);
+    log(LOG_DEBUG, TAG,
+      `Saved ${pathTable.size - skipped} path table entries` +
+      (skipped ? ` (skipped ${skipped} malformed)` : ''));
   }
 
+  /**
+   * Load the persisted path table.
+   * Returns a Map of `hexHash → entryObject` so callers can directly merge it
+   * into transport.pathTable. The on-disk format is a positional array per
+   * entry; we reconstruct the object form here.
+   *
+   * @returns {Promise<Map<string, object>>}
+   */
   async loadPathTable() {
+    const result = new Map();
     const data = await this.backend.get('storage/destination_table');
-    if (!data) return [];
+    if (!data) return result;
     try {
       const entries = msgpackDecode(data);
-      log(LOG_DEBUG, TAG, `Loaded ${entries.length} path table entries`);
-      return entries;
+      if (!Array.isArray(entries)) return result;
+      for (const e of entries) {
+        if (!Array.isArray(e) || e.length < 5) continue;
+        const [hexHash, timestamp, nextHopArr, hops, expires, _unused, ifaceName, announceHashArr] = e;
+        if (!hexHash || timestamp == null) continue;
+        result.set(hexHash, {
+          timestamp,
+          nextHop: nextHopArr ? new Uint8Array(nextHopArr) : null,
+          hops: hops || 0,
+          expires,
+          interface: null,                // resolved later by Transport (we only have name here)
+          interfaceName: ifaceName || null,
+          announcePacketHash: announceHashArr ? new Uint8Array(announceHashArr) : null,
+        });
+      }
+      log(LOG_DEBUG, TAG, `Loaded ${result.size} path table entries`);
     } catch (err) {
       log(LOG_WARNING, TAG, `Failed to parse destination_table: ${err.message}`);
-      return [];
     }
+    return result;
   }
 
   // --- Announce Cache ---
