@@ -340,6 +340,7 @@ export class Reticulum {
 
 // Re-export core classes for convenience
 export { Identity, Destination, Packet, Link, Transport, Channel, ResourceSender, ResourceReceiver };
+export { Buffer, BufferReader, BufferWriter, BidirectionalBuffer } from './Buffer.js';
 export { createAnnounce, validateAnnounce } from './Announce.js';
 export { TCPClientInterface } from './interfaces/TCPClientInterface.js';
 export { TCPServerInterface } from './interfaces/TCPServerInterface.js';
