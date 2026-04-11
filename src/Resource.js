@@ -59,6 +59,7 @@ export const RESOURCE_ADVERTISING = 0x01;
 export const RESOURCE_TRANSFERRING = 0x02;
 export const RESOURCE_COMPLETE    = 0x03;
 export const RESOURCE_FAILED      = 0x04;
+export const RESOURCE_REJECTED    = 0x05;
 
 // Flags
 const FLAG_ENCRYPTED    = 0x01;
@@ -131,6 +132,36 @@ export class ResourceSender {
     this.progress = 0;
     this._onComplete = null;
     this._onProgress = null;
+    this._onFailed = null;
+  }
+
+  /**
+   * Mark this outgoing resource as rejected by the receiver.
+   * Called when a CONTEXT_RESOURCE_RCL packet arrives from the peer.
+   * Matches Python Resource._rejected() in RNS/Resource.py:1088.
+   * @param {string} [reason]
+   */
+  _rejected(reason = 'Resource rejected by receiver') {
+    if (this.status >= RESOURCE_COMPLETE) return;
+    this.status = RESOURCE_REJECTED;
+    log(LOG_INFO, TAG, `Outgoing resource rejected: ${reason}`);
+    if (this._onFailed) this._onFailed(new Error(reason));
+  }
+
+  /**
+   * Cancel this outgoing resource locally. Matches Python Resource.cancel()
+   * (initiator branch) in RNS/Resource.py:1064: sets status FAILED and sends
+   * a RESOURCE_ICL packet to tell the receiver to stop assembling.
+   */
+  async cancel(reason = 'Resource transfer cancelled') {
+    if (this.status >= RESOURCE_COMPLETE) return;
+    this.status = RESOURCE_FAILED;
+    try {
+      await this.link.send(this.hash, CONTEXT_RESOURCE_ICL);
+    } catch (err) {
+      log(LOG_WARNING, TAG, `Could not send resource cancel packet: ${err.message}`);
+    }
+    if (this._onFailed) this._onFailed(new Error(reason));
   }
 
   /**
@@ -330,6 +361,7 @@ export class ResourceSender {
 
   onProgress(fn) { this._onProgress = fn; return this; }
   onComplete(fn) { this._onComplete = fn; return this; }
+  onFailed(fn) { this._onFailed = fn; return this; }
 }
 
 /**
@@ -383,8 +415,21 @@ export class ResourceReceiver {
 
     this._onComplete = null;
     this._onProgress = null;
+    this._onFailed = null;
 
     log(LOG_INFO, TAG, `Received advertisement: ${this.totalParts} parts, ${this.dataSize} bytes`);
+  }
+
+  /**
+   * Cancel this incoming resource. Called from Link when a
+   * CONTEXT_RESOURCE_ICL packet arrives (matching Python Resource.cancel()
+   * non-initiator branch in RNS/Resource.py:1064).
+   */
+  cancel(reason = 'Resource transfer cancelled by sender') {
+    if (this.status >= RESOURCE_COMPLETE) return;
+    this.status = RESOURCE_FAILED;
+    log(LOG_INFO, TAG, `Incoming resource cancelled: ${reason}`);
+    if (this._onFailed) this._onFailed(new Error(reason));
   }
 
   /**
@@ -613,6 +658,16 @@ export class ResourceReceiver {
     this.progress = 1;
 
     log(LOG_INFO, TAG, `Resource assembled and verified: ${data.length} bytes`);
+
+    // Send proof back to the sender. Matches Python Resource.assemble()
+    // in RNS/Resource.py:702 which calls self.prove() immediately after
+    // setting status=COMPLETE.
+    try {
+      await this.sendProof();
+    } catch (err) {
+      log(LOG_WARNING, TAG, `Could not send resource proof: ${err.message}`);
+    }
+
     if (this._onComplete) this._onComplete(data);
     return true;
   }
@@ -642,4 +697,5 @@ export class ResourceReceiver {
 
   onProgress(fn) { this._onProgress = fn; return this; }
   onComplete(fn) { this._onComplete = fn; return this; }
+  onFailed(fn) { this._onFailed = fn; return this; }
 }

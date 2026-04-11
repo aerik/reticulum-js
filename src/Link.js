@@ -44,7 +44,7 @@ import {
   CONTEXT_NONE, CONTEXT_LRPROOF, CONTEXT_LRRTT,
   CONTEXT_KEEPALIVE, CONTEXT_LINKCLOSE, CONTEXT_LINKPROOF,
   CONTEXT_REQUEST, CONTEXT_RESPONSE,
-  CONTEXT_RESOURCE_PRF,
+  CONTEXT_RESOURCE_PRF, CONTEXT_RESOURCE_ICL, CONTEXT_RESOURCE_RCL,
   IDENTITY_HASH_LENGTH,
   IDENTITY_DERIVED_KEY_LENGTH,
 } from './constants.js';
@@ -634,6 +634,44 @@ export class Link extends EventEmitter {
   }
 
   /**
+   * Handle an inbound RESOURCE_ICL (initiator cancel) packet.
+   * The payload is the 32-byte resource hash of the incoming resource the
+   * sender wants to cancel. Matches Python RNS/Link.py:1135.
+   * @param {Uint8Array} plaintext
+   */
+  _handleResourceIcl(plaintext) {
+    if (!plaintext || plaintext.length < 32) return;
+    const resourceHash = plaintext.slice(0, 32);
+    const receiver = this._activeResource;
+    if (receiver && receiver.hash && equal(receiver.hash, resourceHash)) {
+      receiver.cancel('Sender cancelled transfer');
+      this._activeResource = null;
+    } else {
+      log(LOG_DEBUG, TAG, `RESOURCE_ICL for unknown incoming resource ${toHex(resourceHash).slice(0,16)}..`);
+    }
+  }
+
+  /**
+   * Handle an inbound RESOURCE_RCL (receiver-side reject) packet.
+   * The payload is the 32-byte resource hash of an outgoing resource the
+   * peer is rejecting (e.g. because it exceeds the receiver's limit).
+   * Matches Python RNS/Link.py:1144.
+   * @param {Uint8Array} plaintext
+   */
+  _handleResourceRcl(plaintext) {
+    if (!plaintext || plaintext.length < 32) return;
+    const resourceHash = plaintext.slice(0, 32);
+    const hashHex = toHex(resourceHash);
+    const entry = this._outgoingResources.get(hashHex);
+    if (!entry) {
+      log(LOG_DEBUG, TAG, `RESOURCE_RCL for unknown outgoing resource ${hashHex.slice(0,16)}..`);
+      return;
+    }
+    log(LOG_INFO, TAG, `Outgoing resource ${hashHex.slice(0,16)}.. rejected by receiver`);
+    entry.sender._rejected('Resource rejected by receiver (possibly exceeds delivery limit)');
+  }
+
+  /**
    * Close the link.
    */
   async close() {
@@ -968,6 +1006,14 @@ export class Link extends EventEmitter {
         clearTimeout(timer);
         this._outgoingResources.delete(hashHex);
         resolve(data.length);
+      });
+
+      // Receiver rejection (RESOURCE_RCL) or local cancel wakes the promise
+      // up immediately instead of waiting for the full timeout.
+      sender.onFailed((err) => {
+        clearTimeout(timer);
+        this._outgoingResources.delete(hashHex);
+        reject(err);
       });
 
       // Stash a rejector so _teardown / unrelated failures can wake us up
