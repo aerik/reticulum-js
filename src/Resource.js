@@ -53,13 +53,37 @@ const WINDOW_FLEXIBILITY = 4;
 const HASHMAP_IS_NOT_EXHAUSTED = 0x00;
 const HASHMAP_IS_EXHAUSTED     = 0xFF;
 
-// Resource states
-export const RESOURCE_NONE        = 0x00;
-export const RESOURCE_ADVERTISING = 0x01;
-export const RESOURCE_TRANSFERRING = 0x02;
-export const RESOURCE_COMPLETE    = 0x03;
-export const RESOURCE_FAILED      = 0x04;
-export const RESOURCE_REJECTED    = 0x05;
+// Resource states — numbering matches Python RNS/Resource.py:143-151
+// except REJECTED, which Python places at 0x00 (colliding with NONE). We use
+// a distinct terminal value so the `status >= RESOURCE_COMPLETE` early-out
+// pattern used in cancel()/_rejected() works for all terminal states.
+export const RESOURCE_NONE           = 0x00;
+export const RESOURCE_QUEUED         = 0x01;
+export const RESOURCE_ADVERTISED     = 0x02;
+export const RESOURCE_TRANSFERRING   = 0x03;
+export const RESOURCE_AWAITING_PROOF = 0x04;
+export const RESOURCE_ASSEMBLING     = 0x05;
+export const RESOURCE_COMPLETE       = 0x06;
+export const RESOURCE_FAILED         = 0x07;
+export const RESOURCE_CORRUPT        = 0x08;
+export const RESOURCE_REJECTED       = 0x09;
+
+// Watchdog / retry constants — match Python RNS/Resource.py:126-134.
+const PART_TIMEOUT_FACTOR  = 4;
+const PROOF_TIMEOUT_FACTOR = 3;
+const MAX_RETRIES          = 16;
+const MAX_ADV_RETRIES      = 4;
+const MAX_PROOF_RETRIES    = 3;   // Python line 1056
+const SENDER_GRACE_TIME    = 10.0;
+const PROCESSING_GRACE     = 1.0;
+const RETRY_GRACE_TIME     = 0.25;
+const PER_RETRY_DELAY      = 0.5;
+const WATCHDOG_INTERVAL_MS = 1000; // Python's WATCHDOG_MAX_SLEEP = 1.0s
+
+// Default per-link traffic-timeout factor used by the sender's ADVERTISED
+// watchdog when the link hasn't reported an RTT yet. Matches
+// Link.TRAFFIC_TIMEOUT_FACTOR in Python RNS/Link.py:82.
+const TRAFFIC_TIMEOUT_FACTOR = 6;
 
 // Flags
 const FLAG_ENCRYPTED    = 0x01;
@@ -129,10 +153,135 @@ export class ResourceSender {
     this._prepared = false;
 
     this.sentParts = 0;
+    this.lastPartSent = 0;
     this.progress = 0;
     this._onComplete = null;
     this._onProgress = null;
     this._onFailed = null;
+
+    // Watchdog / retry tracking — mirrors Python RNS/Resource.py:339-347
+    this.retriesLeft = MAX_ADV_RETRIES;
+    this.advSent = 0;                // time.time() in seconds when adv was last sent
+    this.lastActivity = 0;
+    this.rtt = null;                 // set on first part request, from (now - advSent)
+    this.timeoutFactor = TRAFFIC_TIMEOUT_FACTOR;
+    this.timeout = 0;                // adv watchdog timeout window
+    this._watchdogTimer = null;
+  }
+
+  /**
+   * Start (or restart) the watchdog timer. Called from advertise() once the
+   * sender has announced itself to the receiver. Matches Python's
+   * `self.watchdog_job()` in `RNS/Resource.py:557`.
+   */
+  _startWatchdog() {
+    if (this._watchdogTimer) return;
+    this._watchdogTimer = setInterval(() => this._watchdogTick(), WATCHDOG_INTERVAL_MS);
+    // Unref so a stray timer doesn't keep Node alive in test processes.
+    if (this._watchdogTimer && typeof this._watchdogTimer.unref === 'function') {
+      this._watchdogTimer.unref();
+    }
+  }
+
+  _stopWatchdog() {
+    if (this._watchdogTimer) {
+      clearInterval(this._watchdogTimer);
+      this._watchdogTimer = null;
+    }
+  }
+
+  /**
+   * One tick of the sender-side watchdog. Mirrors the sender branches of
+   * Python's `Resource.__watchdog_job()` in RNS/Resource.py:561-654.
+   *
+   * Three sender states are handled:
+   *   ADVERTISED      - retry the advertisement if no part request arrived
+   *   TRANSFERRING    - enforce a global max-wait since last activity
+   *   AWAITING_PROOF  - bounded wait for the receiver's proof
+   */
+  _watchdogTick() {
+    if (this.status >= RESOURCE_COMPLETE) {
+      this._stopWatchdog();
+      return;
+    }
+
+    const now = Date.now() / 1000;
+    const linkRtt = (this.link && this.link.rtt) || 1.0;
+
+    if (this.status === RESOURCE_ADVERTISED) {
+      // Python: sleep_time = adv_sent + timeout + PROCESSING_GRACE - now
+      const deadline = this.advSent + this.timeout + PROCESSING_GRACE;
+      if (now < deadline) return;
+
+      if (this.retriesLeft <= 0) {
+        log(LOG_DEBUG, TAG, 'Resource transfer timeout after sending advertisement');
+        this._rejected('Timeout: no part requests received after advertising');
+        return;
+      }
+
+      this.retriesLeft -= 1;
+      log(LOG_DEBUG, TAG,
+        `No part requests received, retrying advertisement ` +
+        `(${MAX_ADV_RETRIES - this.retriesLeft}/${MAX_ADV_RETRIES})`);
+      // Fire-and-forget — same as Python which calls packet.send() inside the
+      // watchdog and ignores return.
+      this._resendAdvertisement().catch((err) => {
+        log(LOG_WARNING, TAG, `Advertisement resend failed: ${err.message}`);
+        this._rejected(`Advertisement resend failed: ${err.message}`);
+      });
+      return;
+    }
+
+    if (this.status === RESOURCE_TRANSFERRING) {
+      // Python (sender branch):
+      //   max_extra_wait = sum((r+1) * PER_RETRY_DELAY for r in range(MAX_RETRIES))
+      //   max_wait = rtt * timeout_factor * max_retries + sender_grace_time + max_extra_wait
+      //   if last_activity + max_wait < now: cancel
+      const maxExtraWait = ((MAX_RETRIES * (MAX_RETRIES + 1)) / 2) * PER_RETRY_DELAY;
+      const rtt = this.rtt || linkRtt;
+      const maxWait = rtt * this.timeoutFactor * MAX_RETRIES + SENDER_GRACE_TIME + maxExtraWait;
+      if (this.lastActivity + maxWait < now) {
+        log(LOG_DEBUG, TAG, 'Resource timed out waiting for part requests');
+        this._rejected('Timeout: receiver stopped requesting parts');
+      }
+      return;
+    }
+
+    if (this.status === RESOURCE_AWAITING_PROOF) {
+      // Python:
+      //   timeout_factor = PROOF_TIMEOUT_FACTOR
+      //   sleep_time = last_part_sent + (rtt*timeout_factor+sender_grace_time) - now
+      this.timeoutFactor = PROOF_TIMEOUT_FACTOR;
+      const rtt = this.rtt || linkRtt;
+      const deadline = this.lastPartSent + (rtt * this.timeoutFactor + SENDER_GRACE_TIME);
+      if (now >= deadline) {
+        if (this.retriesLeft <= 0) {
+          log(LOG_DEBUG, TAG, 'Resource timed out waiting for proof');
+          this._rejected('Timeout: proof not received after last part');
+        } else {
+          // Python re-queries the Transport cache for the proof here; JS has
+          // no equivalent cache, so we just reset the timer and keep waiting.
+          this.retriesLeft -= 1;
+          this.lastPartSent = now;
+          log(LOG_DEBUG, TAG,
+            `No proof received yet, extending wait ` +
+            `(${MAX_PROOF_RETRIES - this.retriesLeft}/${MAX_PROOF_RETRIES})`);
+        }
+      }
+    }
+  }
+
+  /**
+   * Re-pack and resend the advertisement packet. Matches Python
+   * Resource.py:581-585 where the watchdog rebuilds a fresh RESOURCE_ADV
+   * packet on each retry.
+   */
+  async _resendAdvertisement() {
+    const packed = this._packAdvertisement();
+    await this.link.send(packed, CONTEXT_RESOURCE_ADV);
+    const now = Date.now() / 1000;
+    this.advSent = now;
+    this.lastActivity = now;
   }
 
   /**
@@ -144,6 +293,7 @@ export class ResourceSender {
   _rejected(reason = 'Resource rejected by receiver') {
     if (this.status >= RESOURCE_COMPLETE) return;
     this.status = RESOURCE_REJECTED;
+    this._stopWatchdog();
     log(LOG_INFO, TAG, `Outgoing resource rejected: ${reason}`);
     if (this._onFailed) this._onFailed(new Error(reason));
   }
@@ -156,6 +306,7 @@ export class ResourceSender {
   async cancel(reason = 'Resource transfer cancelled') {
     if (this.status >= RESOURCE_COMPLETE) return;
     this.status = RESOURCE_FAILED;
+    this._stopWatchdog();
     try {
       await this.link.send(this.hash, CONTEXT_RESOURCE_ICL);
     } catch (err) {
@@ -200,13 +351,10 @@ export class ResourceSender {
   }
 
   /**
-   * Start the transfer by sending the advertisement.
+   * Build the msgpack-encoded advertisement payload. Extracted from
+   * advertise() so the watchdog can rebuild it on retry.
    */
-  async advertise() {
-    await this._prepareParts();
-    this.status = RESOURCE_ADVERTISING;
-
-    // Build initial hashmap (first HASHMAP_MAX_LEN entries, segment 0)
+  _packAdvertisement() {
     const initialMapCount = Math.min(this.totalParts, HASHMAP_MAX_LEN);
     const hashmap = this.hashmapRaw.slice(0, initialMapCount * MAPHASH_LEN);
 
@@ -226,12 +374,35 @@ export class ResourceSender {
       m: hashmap,
     };
 
-    const packed = new Uint8Array(msgpackEncode(adv));
+    return new Uint8Array(msgpackEncode(adv));
+  }
+
+  /**
+   * Start the transfer by sending the advertisement. Also primes the
+   * watchdog so a silent receiver triggers an adv-resend after
+   * PROCESSING_GRACE. Matches Python RNS/Resource.py:520-538.
+   */
+  async advertise() {
+    await this._prepareParts();
+
+    const packed = this._packAdvertisement();
     await this.link.send(packed, CONTEXT_RESOURCE_ADV);
+
+    const now = Date.now() / 1000;
+    this.advSent = now;
+    this.lastActivity = now;
+    // Initial timeout window for the ADVERTISED state, mirroring Python's
+    // `self.timeout = self.link.rtt * self.link.traffic_timeout_factor`.
+    const linkRtt = (this.link && this.link.rtt) || 1.0;
+    this.timeout = linkRtt * TRAFFIC_TIMEOUT_FACTOR;
+    this.retriesLeft = MAX_ADV_RETRIES;
+    this.status = RESOURCE_ADVERTISED;
 
     log(LOG_INFO, TAG,
       `Advertised resource: ${this.totalParts} parts, ` +
       `${this.originalData.length}b plaintext / ${this.streamData.length}b on-wire`);
+
+    this._startWatchdog();
   }
 
   /**
@@ -240,7 +411,18 @@ export class ResourceSender {
    * @param {Uint8Array} plaintext
    */
   async handleRequest(plaintext) {
-    this.status = RESOURCE_TRANSFERRING;
+    // First request arriving while ADVERTISED → transition to TRANSFERRING.
+    // Python RNS/Resource.py:969-980: computes RTT, switches state, resets
+    // retries_left to MAX_RETRIES.
+    if (this.status !== RESOURCE_TRANSFERRING) {
+      const now = Date.now() / 1000;
+      if (this.rtt === null && this.advSent > 0) {
+        this.rtt = now - this.advSent;
+      }
+      this.status = RESOURCE_TRANSFERRING;
+      this.timeoutFactor = PART_TIMEOUT_FACTOR;
+    }
+    this.retriesLeft = MAX_RETRIES;
 
     // Parse the request
     // Format: flag(1) [+ last_map_hash(4) if exhausted] + resource_hash(32) + requested_hashes(4*N)
@@ -272,12 +454,15 @@ export class ResourceSender {
     // Send requested parts. RESOURCE-context packets are NOT encrypted at the
     // link layer (matches Python Packet.pack: "A resource takes care of
     // encryption by itself"). Use sendRaw to skip the link.encrypt step.
+    const nowSec = Date.now() / 1000;
     for (const reqHash of requestedHashes) {
       // Find which part this hash corresponds to
       for (let i = 0; i < this.mapHashes.length; i++) {
         if (equal(this.mapHashes[i], reqHash)) {
           this.link.sendRaw(this.parts[i], CONTEXT_RESOURCE);
           this.sentParts++;
+          this.lastPartSent = nowSec;
+          this.lastActivity = nowSec;
           this.progress = this.sentParts / this.totalParts;
           if (this._onProgress) this._onProgress(this.progress);
           break;
@@ -291,6 +476,13 @@ export class ResourceSender {
     }
 
     log(LOG_DEBUG, TAG, `Sent ${requestedHashes.length} requested parts (${this.sentParts}/${this.totalParts})`);
+
+    // All parts sent → transition to AWAITING_PROOF.
+    // Python RNS/Resource.py:1054-1056.
+    if (this.sentParts >= this.totalParts) {
+      this.status = RESOURCE_AWAITING_PROOF;
+      this.retriesLeft = MAX_PROOF_RETRIES;
+    }
   }
 
   /**
@@ -354,6 +546,7 @@ export class ResourceSender {
 
     this.status = RESOURCE_COMPLETE;
     this.progress = 1;
+    this._stopWatchdog();
     log(LOG_INFO, TAG, `Resource transfer complete (verified by receiver)`);
     if (this._onComplete) this._onComplete();
     return true;
@@ -417,7 +610,86 @@ export class ResourceReceiver {
     this._onProgress = null;
     this._onFailed = null;
 
+    // Watchdog / retry tracking (receiver side).
+    // Mirrors Python RNS/Resource.py:482-483, where receipt of a part resets
+    // last_activity and retries_left.
+    this.retriesLeft = MAX_RETRIES;
+    this.lastActivity = Date.now() / 1000;
+    this.rtt = null;
+    this.partTimeoutFactor = PART_TIMEOUT_FACTOR;
+    this._watchdogTimer = null;
+    this._lastRequestAt = 0;
+
     log(LOG_INFO, TAG, `Received advertisement: ${this.totalParts} parts, ${this.dataSize} bytes`);
+  }
+
+  _startWatchdog() {
+    if (this._watchdogTimer) return;
+    this._watchdogTimer = setInterval(() => this._watchdogTick(), WATCHDOG_INTERVAL_MS);
+    if (this._watchdogTimer && typeof this._watchdogTimer.unref === 'function') {
+      this._watchdogTimer.unref();
+    }
+  }
+
+  _stopWatchdog() {
+    if (this._watchdogTimer) {
+      clearInterval(this._watchdogTimer);
+      this._watchdogTimer = null;
+    }
+  }
+
+  /**
+   * One tick of the receiver-side watchdog. Mirrors the receiver branch of
+   * Python's `Resource.__watchdog_job()` in RNS/Resource.py:591-625.
+   *
+   * When the outstanding parts haven't arrived within the expected
+   * time-of-flight + a retry grace, shrink the window and re-request.
+   */
+  _watchdogTick() {
+    if (this.status >= RESOURCE_COMPLETE) {
+      this._stopWatchdog();
+      return;
+    }
+    if (this.status !== RESOURCE_TRANSFERRING) return;
+    if (this.outstandingParts === 0) return;
+
+    const now = Date.now() / 1000;
+    const retriesUsed = MAX_RETRIES - this.retriesLeft;
+    const extraWait = retriesUsed * PER_RETRY_DELAY;
+
+    // JS doesn't compute EIFR, so fall back to a simple RTT-based budget:
+    //   (outstanding * rtt) + RETRY_GRACE_TIME
+    // multiplied by partTimeoutFactor. Python's formula at line 600-602 is
+    // more precise but this approximates the same order of magnitude.
+    const linkRtt = (this.link && this.link.rtt) || 1.0;
+    const rtt = this.rtt || linkRtt;
+    const budget = this.partTimeoutFactor * (this.outstandingParts * rtt + RETRY_GRACE_TIME) + extraWait;
+
+    if (this.lastActivity + budget >= now) return;
+
+    if (this.retriesLeft <= 0) {
+      log(LOG_DEBUG, TAG, `Resource receive timeout after ${MAX_RETRIES} retries`);
+      this.cancel(`Timeout: missing ${this.outstandingParts} parts after ${MAX_RETRIES} retries`);
+      return;
+    }
+
+    log(LOG_DEBUG, TAG,
+      `Timed out waiting for ${this.outstandingParts} part(s), ` +
+      `retrying (${retriesUsed + 1}/${MAX_RETRIES})`);
+
+    // Shrink the window on timeout — matches Python Resource.py:612-617.
+    if (this.window > this.windowMin) {
+      this.window -= 1;
+      if (this.windowMax > this.windowMin) {
+        this.windowMax -= 1;
+      }
+    }
+
+    this.retriesLeft -= 1;
+    this.waitingForHmu = false;
+    this.lastActivity = now;
+    this._requestNext().catch((err) =>
+      log(LOG_WARNING, TAG, `Retry requestNext failed: ${err.message}`));
   }
 
   /**
@@ -428,6 +700,7 @@ export class ResourceReceiver {
   cancel(reason = 'Resource transfer cancelled by sender') {
     if (this.status >= RESOURCE_COMPLETE) return;
     this.status = RESOURCE_FAILED;
+    this._stopWatchdog();
     log(LOG_INFO, TAG, `Incoming resource cancelled: ${reason}`);
     if (this._onFailed) this._onFailed(new Error(reason));
   }
@@ -479,6 +752,8 @@ export class ResourceReceiver {
    */
   async accept() {
     this.status = RESOURCE_TRANSFERRING;
+    this.lastActivity = Date.now() / 1000;
+    this._startWatchdog();
     this._requestNext();
   }
 
@@ -567,6 +842,9 @@ export class ResourceReceiver {
         this.receivedParts++;
         this.outstandingParts = Math.max(0, this.outstandingParts - 1);
         this.progress = this.receivedParts / this.totalParts;
+        // Reset retry counter on progress — Python RNS/Resource.py:482-483
+        this.lastActivity = Date.now() / 1000;
+        this.retriesLeft = MAX_RETRIES;
         if (this._onProgress) this._onProgress(this.progress);
 
         log(LOG_DEBUG, TAG, `Received part ${i + 1}/${this.totalParts}`);
@@ -656,6 +934,7 @@ export class ResourceReceiver {
     this.data = data;
     this.status = RESOURCE_COMPLETE;
     this.progress = 1;
+    this._stopWatchdog();
 
     log(LOG_INFO, TAG, `Resource assembled and verified: ${data.length} bytes`);
 

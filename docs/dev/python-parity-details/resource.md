@@ -47,28 +47,30 @@ not re-reported here.
 
 | Symbol | Status | Notes |
 |--------|--------|-------|
-| PART_TIMEOUT_FACTOR | MISSING | No receiver-side part retry |
-| PART_TIMEOUT_FACTOR_AFTER_RTT | MISSING | No RTT-based scaling |
-| PROOF_TIMEOUT_FACTOR | MISSING | Sender uses global 120s, not proof-phase timeout |
-| MAX_RETRIES | MISSING | Python: 16 |
-| MAX_ADV_RETRIES | MISSING | Python: 4 |
-| SENDER_GRACE_TIME / PROCESSING_GRACE / RETRY_GRACE_TIME | MISSING | No grace constants |
-| PER_RETRY_DELAY | MISSING | No per-retry delay |
-| WATCHDOG_MAX_SLEEP | MISSING | No watchdog job |
+| PART_TIMEOUT_FACTOR | MATCHED | 4 |
+| PART_TIMEOUT_FACTOR_AFTER_RTT | MISSING | No RTT-based switch — stays at 4 |
+| PROOF_TIMEOUT_FACTOR | MATCHED | 3 |
+| MAX_RETRIES | MATCHED | 16 |
+| MAX_ADV_RETRIES | MATCHED | 4 |
+| MAX_PROOF_RETRIES | MATCHED | 3 |
+| SENDER_GRACE_TIME / PROCESSING_GRACE / RETRY_GRACE_TIME | MATCHED | Same values |
+| PER_RETRY_DELAY | MATCHED | 0.5 |
+| WATCHDOG_INTERVAL | MATCHED | 1s (Python's WATCHDOG_MAX_SLEEP) |
 
 ### States
 
 | Symbol | Status | Notes |
 |--------|--------|-------|
-| NONE | MATCHED | |
-| ADVERTISING (JS) vs QUEUED/ADVERTISED (Py) | PARTIAL | JS collapses QUEUED+ADVERTISED into ADVERTISING |
-| TRANSFERRING | MATCHED | |
-| AWAITING_PROOF | MISSING | JS doesn't transition after last part sent |
-| ASSEMBLING | MISSING | JS goes directly to COMPLETE |
-| COMPLETE | MATCHED | |
-| FAILED | MATCHED | |
-| CORRUPT | MISSING | JS uses FAILED instead |
-| REJECTED | MATCHED (added 9180b98) | |
+| NONE | MATCHED | 0x00 |
+| QUEUED | MATCHED | 0x01 (added with watchdog) |
+| ADVERTISED | MATCHED | 0x02 (renamed from ADVERTISING) |
+| TRANSFERRING | MATCHED | 0x03 |
+| AWAITING_PROOF | MATCHED | 0x04 (added with watchdog) |
+| ASSEMBLING | MATCHED (constant) | 0x05 — state exists but receiver still transitions straight to COMPLETE inside `_verifyAndComplete`. Not yet used as an intermediate step. |
+| COMPLETE | MATCHED | 0x06 |
+| FAILED | MATCHED | 0x07 |
+| CORRUPT | MATCHED (constant) | 0x08 — defined but receiver still uses FAILED on hash mismatch |
+| REJECTED | MATCHED | 0x09 in JS (Python uses 0x00 — see Resource.js note) |
 
 ### Advertisement
 
@@ -83,10 +85,10 @@ not re-reported here.
 
 | Symbol | Status | Notes |
 |--------|--------|-------|
-| advertise() / _advertise_job | PARTIAL | JS one-shot; Python retries on watchdog |
+| advertise() / _advertise_job | MATCHED | Watchdog retries adv up to MAX_ADV_RETRIES |
 | assemble() / _assemble() | MATCHED | Calls prove() on success (9180b98) |
 | prove() / sendProof() | MATCHED (9180b98) | |
-| validate_proof (sender-side) | PARTIAL | handleProof exists but sender never transitions AWAITING_PROOF |
+| validate_proof (sender-side) | MATCHED | handleProof + AWAITING_PROOF state transition |
 | receive_part / receivePart | MATCHED | Identify by map_hash, grow window |
 | request_next / _requestNext | MATCHED | Windowed requesting with exhaustion flag |
 | request / handleRequest | MATCHED | Parse, send parts, send HMU if exhausted |
@@ -100,19 +102,29 @@ not re-reported here.
 | Compression (bz2) | MISSING (task #39) | |
 | Metadata support | PARTIAL | FLAG unpacked, never used |
 | Multi-segment (split) | MISSING (task #38) | |
-| watchdog_job / threading | MISSING | No background monitor |
+| watchdog_job / threading | MATCHED | setInterval-based; same state-branch logic as Python's __watchdog_job |
 | Progress tracking / callback | MATCHED | |
 
 ## Critical gaps
 
-1. **No watchdog/retry loop** — see parity doc gap #1.
-2. **Sender doesn't track AWAITING_PROOF** — see parity doc gap #7.
+1. ~~**No watchdog/retry loop**~~ — **FIXED**. Sender handles ADVERTISED /
+   TRANSFERRING / AWAITING_PROOF branches with adv-retry, global max-wait,
+   and proof-wait cancel. Receiver retries `_requestNext()` on part-timeout
+   with window shrink and bounded retries. Verified with
+   `scripts/test-resource-retry-js.mjs` — 64 KB transfer survives 3 dropped
+   parts and recovers in ~13 s.
+2. ~~**Sender doesn't track AWAITING_PROOF**~~ — **FIXED**. State transition
+   added in `handleRequest` when `sent_parts == total_parts`.
 3. **No adaptive window tuning** — fixed WINDOW_MAX_SLOW (10) on all links;
    Python would drop to 4 on very slow links.
 4. **Collision guard unused** — linear scan on each request over the entire
    parts array. Slow for large transfers.
-5. **State enum divergence** — Python has 9 states, JS has 6. Not a wire
-   issue; matters only if external code inspects status values.
+5. **EIFR / rate-based timing not ported** — JS uses an RTT × outstanding-parts
+   approximation for the receiver-side timeout. Python's EIFR math is more
+   accurate on lossy links.
+6. **CORRUPT / ASSEMBLING states defined but unused** — receiver still
+   transitions directly from TRANSFERRING to COMPLETE or FAILED. Not
+   observable to callers but diverges from Python's fine-grained lifecycle.
 
 ## Verdict
 

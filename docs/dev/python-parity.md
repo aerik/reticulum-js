@@ -49,7 +49,7 @@ load or against adversarial peers.
 | `Identity.js` ↔ `RNS/Identity.py` | ~75% | Crypto primitives match exactly (HKDF/AES/Ed25519/X25519). Announce validation lives in `Announce.js` not Identity. No `recall()`/`remember()` (uses `Transport.announceTable`). **Multi-ratchet decrypt missing** — JS tries only one ratchet. |
 | `Destination.js` ↔ `RNS/Destination.py` | ~40% | Skeleton: hash, callbacks, name expansion. `announce()` is in `src/Announce.js` (architectural split). **No ratchet management**, **no request handlers**, **no `encrypt()`/`decrypt()` dispatch**, **no `incoming_link_request()`**, **no GROUP destination support**. |
 | `Link.js` ↔ `RNS/Link.py` | ~85% | Handshake, encryption, watchdog, STALE/TIMEOUT, RCL/ICL/PRF dispatch all correct. Missing: `RequestReceipt` API, resource strategy, MDU calc, mode negotiation, Channel, physical stats, `identify()`. |
-| `Resource.js` ↔ `RNS/Resource.py` | ~70% | Advertisement/parts/HMU/proof all match after the 9180b98 fixes. **No watchdog/retry loop.** No adaptive window tuning. No `AWAITING_PROOF` state. No multi-segment, no auto-compression, no metadata, no input_file streaming. Status enum values diverge (JS has 6, Python has 9). |
+| `Resource.js` ↔ `RNS/Resource.py` | ~85% | Advertisement/parts/HMU/proof, watchdog/retry loop, and AWAITING_PROOF state all match. Still missing: adaptive window tuning (EIFR-based), multi-segment, auto-compression, metadata, input_file streaming. Status enum now matches Python numbering except REJECTED. |
 | `Transport.js` ↔ `RNS/Transport.py` | ~65% | Announce validation/forwarding, path table, dedup, link proof routing work. Missing: `random_blobs` list per path (replay window), path state machine, tunnel mode, control destinations (blackhole/instance/network/probe), shared instance, `await_path`. Gateway/boundary/AP modes are intentional edge-only divergence. |
 | `lxmf/LXMRouter.js` ↔ `LXMF/LXMRouter.py` | ~35% | Delivery flows (OPPORTUNISTIC/DIRECT/PROPAGATED) and basic propagation storage work. **Propagation peering subsystem entirely absent** (~40% of Python): no LXMPeer, no `peer()/unpeer()/sync_peers`, no offer protocol, no peer rotation. Also missing: message persistence (in-memory only), stamping/tickets, access control, delivery-limit broadcast in announce (Finding #2). |
 | `lxmf/LXMessage.js` ↔ `LXMF/LXMessage.py` | ~90% | Wire format byte-exact. Pack/unpack/signature/hash all match. Missing only: `RENDERER_BBCODE` constant, accessor helpers (`title_as_string` etc.), paper format (`as_uri`/`as_qr`), delivery system integration (intentionally in LXMRouter). |
@@ -61,21 +61,26 @@ KISS, Pipe, RNode variants, Serial, Weave — all intentional edge-device scope.
 
 ## Critical gaps (ranked)
 
-### 1. Resource transfer has no retry / watchdog loop  *(reliability)*
+### 1. ~~Resource transfer has no retry / watchdog loop~~ — FIXED
 
-**Impact**: On lossy or slow links a single dropped packet causes the whole
-transfer to wait out the 120 s global timeout. Python retries up to 16 parts
-(`MAX_RETRIES`), 4 advertisements (`MAX_ADV_RETRIES`), with `PER_RETRY_DELAY`
-(0.5 s) and `SENDER_GRACE_TIME` (10 s), plus a `watchdog_job` daemon thread.
-JS has none of this.
+**Status**: Closed in the commit after the parity sweep.
 
-**Files**: `src/Resource.js` — no watchdog, no retry counters, no
-`PART_TIMEOUT_FACTOR` etc.
+**Result**: `ResourceSender` now handles three states in its watchdog
+(`ADVERTISED` / `TRANSFERRING` / `AWAITING_PROOF`) with Python-matching
+constants (`MAX_ADV_RETRIES=4`, `MAX_RETRIES=16`, `MAX_PROOF_RETRIES=3`,
+`PART_TIMEOUT_FACTOR=4`, `PROOF_TIMEOUT_FACTOR=3`, `SENDER_GRACE_TIME=10s`,
+`PROCESSING_GRACE=1s`, `RETRY_GRACE_TIME=0.25s`, `PER_RETRY_DELAY=0.5s`).
+`ResourceReceiver` retries `_requestNext()` on part-timeout and shrinks the
+window on each retry, matching Python `__watchdog_job()` lines 591-625.
 
-**Fix shape**: add a watchdog interval on `ResourceSender` that tracks
-`lastProgressAt`, retries unacked parts, and escalates to rejection on
-max-retries. Separate watchdog on `ResourceReceiver` that times out outstanding
-part requests. Port the constants block from `RNS/Resource.py:130-190`.
+Verified with `scripts/test-resource-retry-js.mjs` — a 64 KB transfer
+survives 3 dropped RESOURCE part packets and recovers byte-exact in ~13 s
+(vs a happy-path 30-40 ms).
+
+Simplifications vs. Python: EIFR rate-based timing is approximated with
+`RTT * outstanding_parts`; proof-cache-query on timeout is skipped because
+JS Transport has no equivalent cache; `PART_TIMEOUT_FACTOR_AFTER_RTT` switch
+is not implemented (stays at 4).
 
 ### 2. Forward secrecy: no ratchet rotation or persistence  *(crypto)*
 
@@ -145,14 +150,11 @@ encoding for timestamp + stamp value, atomic replace on write.
 filename/scoring convention as Python, so a node can be restarted without
 losing queued messages.
 
-### 7. Resource: no AWAITING_PROOF state / wrong sender-side timeout  *(correctness)*
+### 7. ~~Resource: no AWAITING_PROOF state~~ — FIXED
 
-**Impact**: `ResourceSender.handleProof()` exists but the sender doesn't
-transition to `AWAITING_PROOF` after sending the last part; it just waits on
-the generic 120 s link timeout. Python uses a separate `PROOF_TIMEOUT_FACTOR`
-(3×RTT-ish) for this phase so failures are detected ~10× faster.
-
-**Files**: `src/Resource.js:ResourceSender`, `src/Link.js:sendResource()`.
+Rolled into the watchdog fix above. `ResourceSender.handleRequest()` now
+transitions to `RESOURCE_AWAITING_PROOF` when `sentParts >= totalParts`, and
+the watchdog enforces `PROOF_TIMEOUT_FACTOR * rtt + SENDER_GRACE_TIME`.
 
 ### 8. Transport: no `random_blobs` list per path  *(replay-window)*
 
