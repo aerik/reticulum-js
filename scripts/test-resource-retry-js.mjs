@@ -9,7 +9,7 @@
  * Usage: node scripts/test-resource-retry-js.mjs [size_kb] [drop_count]
  */
 
-import { Link } from '../src/Link.js';
+import { Link, ACCEPT_ALL } from '../src/Link.js';
 import { Transport } from '../src/Transport.js';
 import { Identity } from '../src/Identity.js';
 import { Destination } from '../src/Destination.js';
@@ -96,6 +96,7 @@ const { initiatorLink, responderLink, initiatorIface } = await setupLinkedPair()
 console.log(`Links established. Dropping first ${dropCount} RESOURCE parts going initiator→responder, sending ${size} bytes...`);
 
 initiatorIface.dropResourcePartsRemaining = dropCount;
+responderLink.setResourceStrategy(ACCEPT_ALL);
 
 const receivePromise = new Promise((resolve, reject) => {
   responderLink.on('resource_complete', (data) => resolve(data));

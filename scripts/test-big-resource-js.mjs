@@ -6,7 +6,7 @@
  * Lets us test large resource sizes without involving Python or TCP.
  */
 
-import { Link } from '../src/Link.js';
+import { Link, ACCEPT_ALL } from '../src/Link.js';
 import { Transport } from '../src/Transport.js';
 import { Identity } from '../src/Identity.js';
 import { Destination } from '../src/Destination.js';
@@ -75,7 +75,7 @@ const size = sizeKb * 1024;
 const { initiatorLink, responderLink } = await setupLinkedPair();
 console.log(`Links established. Sending ${size} bytes...`);
 
-// Link auto-accepts resources and emits 'resource_complete' when done.
+responderLink.setResourceStrategy(ACCEPT_ALL);
 const receivePromise = new Promise((resolve, reject) => {
   responderLink.on('resource_complete', (data) => resolve(data));
   setTimeout(() => reject(new Error('receive timeout')), 120_000);

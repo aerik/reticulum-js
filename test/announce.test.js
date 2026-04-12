@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { createAnnounce, validateAnnounce, makeRandomBlob, extractTimestamp } from '../src/Announce.js';
+import { Transport } from '../src/Transport.js';
+import { EventEmitter } from '../src/utils/events.js';
 import { Identity } from '../src/Identity.js';
 import { Destination } from '../src/Destination.js';
 import { Packet } from '../src/Packet.js';
@@ -215,6 +217,75 @@ describe('Announce', () => {
       expect(equal(validated.identity.hash, id.hash)).toBe(true);
       expect(equal(validated.destinationHash, dest.hash)).toBe(true);
       expect(equal(validated.appData, appData)).toBe(true);
+    });
+  });
+
+  describe('Transport random_blob replay detection', () => {
+    class MockIface extends EventEmitter {
+      constructor(name) { super(); this.name = name; this.online = true; this.sent = []; }
+      send(data) { this.sent.push(new Uint8Array(data)); }
+    }
+
+    it('accepts first announce and records randomBlobs', () => {
+      const transport = new Transport();
+      const iface = new MockIface('test');
+      transport.registerInterface(iface);
+
+      const id = Identity.generate();
+      const dest = new Destination(id, DEST_IN, DEST_SINGLE, 'app', 'svc');
+      const pkt = createAnnounce(dest);
+      const raw = pkt.pack();
+
+      iface.emit('packet', raw);
+
+      const destHex = toHex(dest.hash);
+      expect(transport.pathTable.has(destHex)).toBe(true);
+      const entry = transport.pathTable.get(destHex);
+      expect(entry.randomBlobs).toBeInstanceOf(Array);
+      expect(entry.randomBlobs).toHaveLength(1);
+    });
+
+    it('rejects replayed announce with same random_blob', () => {
+      const transport = new Transport();
+      const iface = new MockIface('test');
+      transport.registerInterface(iface);
+
+      const id = Identity.generate();
+      const dest = new Destination(id, DEST_IN, DEST_SINGLE, 'app', 'svc');
+      const pkt = createAnnounce(dest);
+      const raw = pkt.pack();
+
+      // First announce
+      iface.emit('packet', new Uint8Array(raw));
+      const destHex = toHex(dest.hash);
+      expect(transport.announceTable.has(destHex)).toBe(true);
+      const firstTimestamp = transport.pathTable.get(destHex).timestamp;
+
+      // Wait a tick, then replay the exact same packet
+      transport.pathTable.get(destHex).timestamp = firstTimestamp - 10; // rewind so we detect no update
+
+      iface.emit('packet', new Uint8Array(raw));
+      // Path table timestamp should NOT have been updated — announce was a replay
+      expect(transport.pathTable.get(destHex).timestamp).toBe(firstTimestamp - 10);
+    });
+
+    it('accepts a new announce with a different random_blob', () => {
+      const transport = new Transport();
+      const iface = new MockIface('test');
+      transport.registerInterface(iface);
+
+      const id = Identity.generate();
+      const dest = new Destination(id, DEST_IN, DEST_SINGLE, 'app', 'svc');
+
+      const pkt1 = createAnnounce(dest);
+      iface.emit('packet', pkt1.pack());
+      const destHex = toHex(dest.hash);
+      expect(transport.pathTable.get(destHex).randomBlobs).toHaveLength(1);
+
+      // Second announce with a fresh random_blob (different announce call)
+      const pkt2 = createAnnounce(dest);
+      iface.emit('packet', pkt2.pack());
+      expect(transport.pathTable.get(destHex).randomBlobs).toHaveLength(2);
     });
   });
 });

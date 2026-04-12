@@ -1,5 +1,8 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { Link, LINK_PENDING, LINK_HANDSHAKE, LINK_ACTIVE, LINK_CLOSED } from '../src/Link.js';
+import {
+  Link, LINK_PENDING, LINK_HANDSHAKE, LINK_ACTIVE, LINK_CLOSED,
+  ACCEPT_NONE, ACCEPT_APP, ACCEPT_ALL,
+} from '../src/Link.js';
 import { Transport } from '../src/Transport.js';
 import { Identity } from '../src/Identity.js';
 import { Destination } from '../src/Destination.js';
@@ -24,6 +27,9 @@ class MockInterface extends EventEmitter {
   }
   send(data) {
     this.sent.push(new Uint8Array(data));
+    if (this.peer) {
+      setImmediate(() => this.peer.emit('packet', new Uint8Array(data)));
+    }
   }
 }
 
@@ -108,6 +114,47 @@ async function setupLinkedPair() {
     initiatorIface,
     responderIface,
   };
+}
+
+/**
+ * Like setupLinkedPair but with auto-piped interfaces so resource transfers
+ * can flow end-to-end without manual packet relay.
+ */
+async function setupLinkedPairWired() {
+  const responderIdentity = Identity.generate();
+  const responderDest = new Destination(responderIdentity, DEST_IN, DEST_SINGLE, 'test', 'link');
+
+  const responderIface = new MockInterface('responder');
+  const responderTransport = new Transport();
+  responderTransport.registerInterface(responderIface);
+  responderTransport.registerDestination(responderDest);
+  responderDest.setLinkCallback(() => true);
+
+  const initiatorIface = new MockInterface('initiator');
+  const initiatorTransport = new Transport();
+  initiatorTransport.registerInterface(initiatorIface);
+
+  // Wire the two interfaces so packets flow bidirectionally
+  initiatorIface.peer = responderIface;
+  responderIface.peer = initiatorIface;
+
+  initiatorTransport.announceTable.set(toHex(responderDest.hash), {
+    identity: Identity.fromPublicKey(responderIdentity.publicKey),
+    appData: null, hops: 1, timestamp: Date.now() / 1000,
+  });
+
+  const initiatorLink = Link.init(responderDest, initiatorTransport);
+  initiatorTransport.registerPendingLink(initiatorLink);
+
+  await new Promise(r => initiatorLink.on('established', r));
+  await new Promise(r => setImmediate(r));
+
+  let responderLink = null;
+  for (const [, link] of responderTransport.linkTable) {
+    if (link !== initiatorLink) { responderLink = link; break; }
+  }
+
+  return { initiatorLink, responderLink, initiatorTransport, responderTransport };
 }
 
 describe('Link', () => {
@@ -252,6 +299,81 @@ describe('Link', () => {
 
       await initiatorLink.close();
       expect(closedReason).not.toBeNull();
+    });
+  });
+
+  describe('resource_strategy', () => {
+    it('defaults to ACCEPT_NONE', async () => {
+      const { responderLink } = await setupLinkedPair();
+      expect(responderLink.resourceStrategy).toBe(ACCEPT_NONE);
+    });
+
+    it('setResourceStrategy validates input', async () => {
+      const { responderLink } = await setupLinkedPair();
+      expect(() => responderLink.setResourceStrategy(0xFF)).toThrow(/Unsupported/);
+      responderLink.setResourceStrategy(ACCEPT_ALL);
+      expect(responderLink.resourceStrategy).toBe(ACCEPT_ALL);
+    });
+
+    it('ACCEPT_NONE silently ignores resource ADV', async () => {
+      const { initiatorLink, responderLink } = await setupLinkedPairWired();
+      responderLink.setResourceStrategy(ACCEPT_NONE);
+
+      let completed = false;
+      responderLink.on('resource_complete', () => { completed = true; });
+
+      // Send a resource — it should be silently ignored on the responder
+      const sendPromise = initiatorLink.sendResource(randomBytes(100), { timeoutMs: 500 });
+      await expect(sendPromise).rejects.toThrow(/timeout/i);
+      expect(completed).toBe(false);
+    });
+
+    it('ACCEPT_ALL auto-accepts resources', async () => {
+      const { initiatorLink, responderLink } = await setupLinkedPairWired();
+      responderLink.setResourceStrategy(ACCEPT_ALL);
+
+      const data = randomBytes(500);
+      const receivePromise = new Promise((resolve) => {
+        responderLink.on('resource_complete', (d) => resolve(d));
+      });
+
+      const bytes = await initiatorLink.sendResource(data, { timeoutMs: 5000 });
+      expect(bytes).toBe(500);
+
+      const received = await receivePromise;
+      expect(equal(received, data)).toBe(true);
+    });
+
+    it('ACCEPT_APP calls callback and rejects when it returns false', async () => {
+      const { initiatorLink, responderLink } = await setupLinkedPairWired();
+      responderLink.setResourceStrategy(ACCEPT_APP);
+
+      let callbackCalled = false;
+      responderLink.setResourceCallback((adv) => {
+        callbackCalled = true;
+        expect(adv.dataSize).toBeGreaterThan(0);
+        expect(adv.link).toBe(responderLink);
+        return false; // reject
+      });
+
+      const sendPromise = initiatorLink.sendResource(randomBytes(100), { timeoutMs: 2000 });
+      await expect(sendPromise).rejects.toThrow(/reject/i);
+      expect(callbackCalled).toBe(true);
+    });
+
+    it('ACCEPT_APP accepts when callback returns true', async () => {
+      const { initiatorLink, responderLink } = await setupLinkedPairWired();
+      responderLink.setResourceStrategy(ACCEPT_APP);
+      responderLink.setResourceCallback((adv) => adv.dataSize <= 1000);
+
+      const data = randomBytes(500);
+      const receivePromise = new Promise((resolve) => {
+        responderLink.on('resource_complete', (d) => resolve(d));
+      });
+      const bytes = await initiatorLink.sendResource(data, { timeoutMs: 5000 });
+      expect(bytes).toBe(500);
+      const received = await receivePromise;
+      expect(equal(received, data)).toBe(true);
     });
   });
 });

@@ -15,7 +15,7 @@
 
 import { EventEmitter } from './utils/events.js';
 import { Packet } from './Packet.js';
-import { validateAnnounce } from './Announce.js';
+import { validateAnnounce, extractTimestamp } from './Announce.js';
 import { Identity } from './Identity.js';
 import { Destination } from './Destination.js';
 import { log, LOG_DEBUG, LOG_INFO, LOG_WARNING, LOG_ERROR, LOG_VERBOSE, LOG_EXTREME } from './utils/log.js';
@@ -49,11 +49,29 @@ const ANNOUNCES_CHECK_INTERVAL = 1;  // seconds — process rebroadcast queue ev
 const REVERSE_TIMEOUT = 8 * 60;      // seconds — reverse table entry lifetime (8 min)
 const DESTINATION_TIMEOUT = 7 * 24 * 60 * 60; // seconds — announce table lifetime (7 days)
 
+// Random blob tracking — matches Python Transport.py:92-93.
+const MAX_RANDOM_BLOBS = 64;
+
 // Table size caps (prevent unbounded growth on long-running nodes)
 const MAX_PATH_TABLE_SIZE = 50000;
 const MAX_ANNOUNCE_TABLE_SIZE = 50000;
 const MAX_REVERSE_TABLE_SIZE = 10000;
 const MAX_ANNOUNCE_CACHE_SIZE = 20000;
+
+/**
+ * Compute the newest emission timebase from a list of random blobs.
+ * Matches Python `Transport.timebase_from_random_blobs` in Transport.py:2939.
+ * @param {Uint8Array[]} blobs
+ * @returns {number} Unix timestamp (seconds)
+ */
+function _timebaseFromBlobs(blobs) {
+  let timebase = 0;
+  for (const blob of blobs) {
+    const ts = extractTimestamp(blob);
+    if (ts > timebase) timebase = ts;
+  }
+  return timebase;
+}
 
 export class Transport extends EventEmitter {
   /**
@@ -344,16 +362,38 @@ export class Transport extends EventEmitter {
         .catch((err) => log(LOG_WARNING, TAG, `Failed to remember ratchet: ${err.message}`));
     }
 
-    // Check if we should accept this announce (compare with existing path)
+    // Check if we should accept this announce (compare with existing path).
+    // Includes random_blob replay detection matching Python Transport.py:1620-1670.
     const existing = this.pathTable.get(destHex);
     if (existing) {
-      // Accept if fewer hops or if existing path has expired
+      // Replay check: if this exact randomBlob was already seen for this
+      // destination, this is a replayed or re-heard announce — skip it.
+      // Matches Python: `if not random_blob in random_blobs`.
+      const existingBlobs = existing.randomBlobs || [];
+      const isReplay = existingBlobs.some((b) => equal(b, randomBlob));
+      if (isReplay) {
+        log(LOG_DEBUG, TAG, `Announce for ${destHex} is a replay (random_blob already seen)`);
+        return;
+      }
+
+      // Accept if fewer hops, or if emission timestamp is newer, or if
+      // the existing path has expired.
       const now = Date.now() / 1000;
-      if (packet.hops >= existing.hops && now < existing.expires) {
+      const existingTimebase = _timebaseFromBlobs(existingBlobs);
+      if (packet.hops >= existing.hops && now < existing.expires && timestamp <= existingTimebase) {
         log(LOG_DEBUG, TAG, `Announce for ${destHex} not better than existing path (${packet.hops} >= ${existing.hops})`);
+        // Still record the blob even when we don't update the path, so
+        // future copies of this same announce are filtered as replays.
+        existingBlobs.push(new Uint8Array(randomBlob));
+        if (existingBlobs.length > MAX_RANDOM_BLOBS) existingBlobs.splice(0, existingBlobs.length - MAX_RANDOM_BLOBS);
         return;
       }
     }
+
+    // Build random_blobs list: carry forward existing blobs + new one.
+    const randomBlobs = existing && existing.randomBlobs ? [...existing.randomBlobs] : [];
+    randomBlobs.push(new Uint8Array(randomBlob));
+    if (randomBlobs.length > MAX_RANDOM_BLOBS) randomBlobs.splice(0, randomBlobs.length - MAX_RANDOM_BLOBS);
 
     // Cache the identity
     this.announceTable.set(destHex, {
@@ -372,6 +412,7 @@ export class Transport extends EventEmitter {
       expires: now + PATHFINDER_E,
       interface: packet.receivingInterface,
       announcePacketHash: packet.packetHash,
+      randomBlobs,
     });
 
     log(LOG_INFO, TAG, `Validated announce for ${destHex} from ${identity.hexHash} (hops: ${packet.hops}${appData ? ', app_data: ' + appData.length + 'b' : ''})`);

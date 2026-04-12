@@ -63,6 +63,11 @@ export const TIMEOUT            = 0x01;
 export const INITIATOR_CLOSED   = 0x02;
 export const DESTINATION_CLOSED = 0x03;
 
+// Resource acceptance strategies — match Python RNS/Link.py:120-122.
+export const ACCEPT_NONE = 0x00;
+export const ACCEPT_APP  = 0x01;
+export const ACCEPT_ALL  = 0x02;
+
 // Sizes
 const ECPUBSIZE = 64; // 32 X25519 + 32 Ed25519
 
@@ -128,6 +133,13 @@ export class Link extends EventEmitter {
 
     // Incoming resource tracking
     this._activeResource = null;
+
+    // Resource acceptance strategy — matches Python RNS/Link.py:120-122,242.
+    // Default is ACCEPT_NONE (ignore all incoming resource advertisements).
+    // LXMF sets ACCEPT_APP with a callback so the router can check size limits.
+    this.resourceStrategy = ACCEPT_NONE;
+    this._resourceCallback = null;          // callback(adv) → bool, for ACCEPT_APP
+    this._resourceConcludedCallback = null; // callback(resource)
 
     // Keepalive / stale detection (matching Python RNS/Link.py watchdog)
     this._initiator = false;
@@ -568,22 +580,62 @@ export class Link extends EventEmitter {
 
   /**
    * Handle an incoming resource advertisement on this link.
-   * Auto-accepts and begins receiving parts.
+   *
+   * Dispatches according to `this.resourceStrategy`, matching Python
+   * RNS/Link.py:1069-1102:
+   *   ACCEPT_NONE → silently ignore
+   *   ACCEPT_APP  → call `_resourceCallback(adv)`, accept if true, reject if false
+   *   ACCEPT_ALL  → auto-accept
+   *
    * @param {Uint8Array} plaintext - Decrypted RESOURCE_ADV data
    */
   _handleResourceAdv(plaintext) {
     try {
+      // Parse the advertisement just enough to inspect size / hash for the
+      // strategy callback. If the strategy rejects, we never fully construct
+      // the receiver — just send an RCL with the resource hash.
       const receiver = new ResourceReceiver(this, plaintext);
-      this._activeResource = receiver;
 
       log(LOG_INFO, TAG, `Resource advertised: ${receiver.totalParts} parts, ${receiver.dataSize} bytes`);
+
+      // --- Strategy dispatch ---
+      if (this.resourceStrategy === ACCEPT_NONE) {
+        log(LOG_DEBUG, TAG, 'Resource ignored (strategy=ACCEPT_NONE)');
+        return;
+      }
+
+      if (this.resourceStrategy === ACCEPT_APP) {
+        if (!this._resourceCallback) {
+          log(LOG_DEBUG, TAG, 'Resource ignored (strategy=ACCEPT_APP, no callback)');
+          return;
+        }
+        const advInfo = {
+          dataSize: receiver.dataSize,
+          totalParts: receiver.totalParts,
+          hash: receiver.hash,
+          link: this,
+        };
+        let accepted = false;
+        try {
+          accepted = this._resourceCallback(advInfo);
+        } catch (err) {
+          log(LOG_WARNING, TAG, `Resource accept callback error: ${err.message}`);
+        }
+        if (!accepted) {
+          log(LOG_DEBUG, TAG, `Resource rejected by callback (${receiver.dataSize} bytes)`);
+          this.send(receiver.hash, CONTEXT_RESOURCE_RCL).catch(() => {});
+          return;
+        }
+      }
+      // ACCEPT_ALL (or ACCEPT_APP that returned true) → accept the resource.
+
+      this._activeResource = receiver;
 
       receiver.onComplete((data) => {
         log(LOG_INFO, TAG, `Resource complete: ${data.length} bytes, requestId=${receiver.requestId ? toHex(receiver.requestId).slice(0,16) : 'null'}, pendingRequests=${this._pendingRequests.size}`);
 
         // Check if this is a response to a pending request
         if (receiver.requestId || this._pendingRequests.size > 0) {
-          // The resource data is msgpack [request_id, response_data]
           try {
             const unpacked = msgpackDecode(data);
             if (Array.isArray(unpacked) && unpacked.length >= 2) {
@@ -601,7 +653,6 @@ export class Link extends EventEmitter {
         this._activeResource = null;
       });
 
-      // Auto-accept
       receiver.accept().catch(err => {
         log(LOG_WARNING, TAG, `Resource accept failed: ${err.message}`);
       });
@@ -669,6 +720,39 @@ export class Link extends EventEmitter {
     }
     log(LOG_INFO, TAG, `Outgoing resource ${hashHex.slice(0,16)}.. rejected by receiver`);
     entry.sender._rejected('Resource rejected by receiver (possibly exceeds delivery limit)');
+  }
+
+  /**
+   * Set the resource acceptance strategy for this link.
+   * Matches Python `Link.set_resource_strategy` in RNS/Link.py:1296.
+   * @param {number} strategy - ACCEPT_NONE, ACCEPT_APP, or ACCEPT_ALL
+   */
+  setResourceStrategy(strategy) {
+    if (strategy !== ACCEPT_NONE && strategy !== ACCEPT_APP && strategy !== ACCEPT_ALL) {
+      throw new TypeError('Unsupported resource strategy');
+    }
+    this.resourceStrategy = strategy;
+  }
+
+  /**
+   * Set the callback invoked when a resource advertisement arrives on this
+   * link (only used when strategy is ACCEPT_APP). The callback receives a
+   * lightweight advertisement object `{ dataSize, totalParts, hash, link }`
+   * and must return `true` to accept or `false` to reject.
+   * Matches Python `Link.set_resource_callback` in RNS/Link.py:1268.
+   * @param {function({dataSize:number, totalParts:number, hash:Uint8Array, link:Link}):boolean} callback
+   */
+  setResourceCallback(callback) {
+    this._resourceCallback = callback;
+  }
+
+  /**
+   * Set the callback invoked when an accepted resource transfer concludes
+   * (success or failure).
+   * @param {function} callback
+   */
+  setResourceConcludedCallback(callback) {
+    this._resourceConcludedCallback = callback;
   }
 
   /**

@@ -17,7 +17,7 @@
 import { EventEmitter } from '../utils/events.js';
 import { Destination } from '../Destination.js';
 import { Identity } from '../Identity.js';
-import { Link } from '../Link.js';
+import { Link, ACCEPT_APP } from '../Link.js';
 import { Packet } from '../Packet.js';
 import {
   LXMessage, LXMF_OVERHEAD, DESTINATION_LENGTH, SIGNATURE_LENGTH,
@@ -25,7 +25,8 @@ import {
   OUTBOUND, SENDING, SENT, DELIVERED, FAILED,
 } from './LXMessage.js';
 import { APP_NAME, MESSAGE_GET_PATH, MESSAGE_EXPIRY,
-         ERROR_NO_IDENTITY, ERROR_NO_ACCESS, PROPAGATION_LIMIT } from './constants.js';
+         ERROR_NO_IDENTITY, ERROR_NO_ACCESS, PROPAGATION_LIMIT,
+         DELIVERY_LIMIT } from './constants.js';
 import { sha256Hash, truncatedHash } from '../utils/crypto.js';
 import { concat, toHex, equal, fromUtf8 } from '../utils/bytes.js';
 import { log, LOG_DEBUG, LOG_INFO, LOG_WARNING, LOG_ERROR } from '../utils/log.js';
@@ -58,6 +59,10 @@ export class LXMRouter extends EventEmitter {
     this.storage = options.storage || null;
     this.messageExpiry = options.messageExpiry || MESSAGE_EXPIRY;
     this.propagationLimit = (options.propagationLimit || PROPAGATION_LIMIT) * 1000;
+
+    // Maximum data size accepted for a single inbound delivery resource, in KB.
+    // Matches Python LXMF/LXMRouter.py:56 DELIVERY_LIMIT = 1000.
+    this.deliveryPerTransferLimit = options.deliveryLimit || DELIVERY_LIMIT;
 
     // Delivery destinations: destHashHex → { identity, destination, displayName, stampCost }
     this.deliveryDestinations = new Map();
@@ -242,11 +247,30 @@ export class LXMRouter extends EventEmitter {
 
     this._deliveryLinks.set(destHex, link);
 
+    // Resource acceptance strategy with delivery-limit check, matching Python
+    // LXMRouter.delivery_link_established() → sets ACCEPT_APP with
+    // delivery_resource_advertised callback (LXMRouter.py:1846-1868).
+    const limit = this.deliveryPerTransferLimit * 1000; // KB → bytes
+    link.setResourceStrategy(ACCEPT_APP);
+    link.setResourceCallback((adv) => {
+      if (limit != null && adv.dataSize > limit) {
+        log(LOG_DEBUG, TAG,
+          `Rejecting incoming delivery resource: ${adv.dataSize} bytes ` +
+          `exceeds limit of ${limit} bytes`);
+        return false;
+      }
+      return true;
+    });
+
     // Set up to receive messages as packets or resources on this link
     link.on('data', (plaintext, packet) => {
       // Send delivery proof (matching Python delivery_packet → packet.prove())
       if (packet) link.provePacket(packet);
       this._deliveryLinkData(plaintext, destHex, DIRECT);
+    });
+
+    link.on('resource_complete', (data) => {
+      this._deliveryLinkData(data, destHex, DIRECT);
     });
 
     link.on('closed', () => {

@@ -16,7 +16,11 @@ Triggering question: "Why does a 1 MB LXMF DIRECT send to Python LXMF fail with
   `Resource.assemble()` which calls `self.prove()` at COMPLETE. Verified with
   `scripts/test-big-resource-js.mjs` — 500KB/1MB pure-JS transfers complete in
   a few hundred ms (previously timed out at 120s).
-- **Finding 2 (delivery_limit fail-fast) — STILL OPEN.** Not yet wired.
+- **Finding 2 (delivery_limit) — FIXED.** JS LXMRouter now enforces
+  `DELIVERY_LIMIT` on the receiver side via `ACCEPT_APP` resource strategy
+  callback in `_deliveryLinkEstablished`. Oversize resources are rejected
+  with RCL. (Note: Python also doesn't broadcast the limit in announces —
+  the check is receiver-side only on both platforms.)
 
 ## TL;DR (historical)
 

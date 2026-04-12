@@ -48,9 +48,9 @@ load or against adversarial peers.
 | `Packet.js` ↔ `RNS/Packet.py` | ~85% | Wire format matches; `pack()` doesn't encrypt (callers do it); no `PacketReceipt`/`ProofDestination`; LRPROOF special-case not in Packet itself (Link handles it). |
 | `Identity.js` ↔ `RNS/Identity.py` | ~90% | Crypto primitives, multi-ratchet decrypt, and class-level known-ratchets store (remember/recall/clean + RATCHET_EXPIRY) all match Python. Announce validation lives in `Announce.js`, known-destinations in `Transport.announceTable`. |
 | `Destination.js` ↔ `RNS/Destination.py` | ~60% | Hash, callbacks, name expansion, and full ratchet management (rotation, persistence, enforce, retained count, interval) now match Python. `announce()` is in `src/Announce.js` (architectural split). Still missing: request handlers, `encrypt()`/`decrypt()` dispatch, `incoming_link_request()`, GROUP destination support. |
-| `Link.js` ↔ `RNS/Link.py` | ~85% | Handshake, encryption, watchdog, STALE/TIMEOUT, RCL/ICL/PRF dispatch all correct. Missing: `RequestReceipt` API, resource strategy, MDU calc, mode negotiation, Channel, physical stats, `identify()`. |
+| `Link.js` ↔ `RNS/Link.py` | ~90% | Handshake, encryption, watchdog, STALE/TIMEOUT, RCL/ICL/PRF dispatch, and resource_strategy (ACCEPT_NONE/APP/ALL) all correct. Missing: `RequestReceipt` API, MDU calc, mode negotiation, Channel, physical stats, `identify()`. |
 | `Resource.js` ↔ `RNS/Resource.py` | ~85% | Advertisement/parts/HMU/proof, watchdog/retry loop, and AWAITING_PROOF state all match. Still missing: adaptive window tuning (EIFR-based), multi-segment, auto-compression, metadata, input_file streaming. Status enum now matches Python numbering except REJECTED. |
-| `Transport.js` ↔ `RNS/Transport.py` | ~65% | Announce validation/forwarding, path table, dedup, link proof routing work. Missing: `random_blobs` list per path (replay window), path state machine, tunnel mode, control destinations (blackhole/instance/network/probe), shared instance, `await_path`. Gateway/boundary/AP modes are intentional edge-only divergence. |
+| `Transport.js` ↔ `RNS/Transport.py` | ~70% | Announce validation/forwarding, path table, dedup, link proof routing, and random_blob replay detection all work. Missing: path state machine, tunnel mode, control destinations (blackhole/instance/network/probe), shared instance, `await_path`. Gateway/boundary/AP modes are intentional edge-only divergence. |
 | `lxmf/LXMRouter.js` ↔ `LXMF/LXMRouter.py` | ~35% | Delivery flows (OPPORTUNISTIC/DIRECT/PROPAGATED) and basic propagation storage work. **Propagation peering subsystem entirely absent** (~40% of Python): no LXMPeer, no `peer()/unpeer()/sync_peers`, no offer protocol, no peer rotation. Also missing: message persistence (in-memory only), stamping/tickets, access control, delivery-limit broadcast in announce (Finding #2). |
 | `lxmf/LXMessage.js` ↔ `LXMF/LXMessage.py` | ~90% | Wire format byte-exact. Pack/unpack/signature/hash all match. Missing only: `RENDERER_BBCODE` constant, accessor helpers (`title_as_string` etc.), paper format (`as_uri`/`as_qr`), delivery system integration (intentionally in LXMRouter). |
 
@@ -130,17 +130,19 @@ success. Legacy single-ratchet callers (no options arg) still work via the
 instance `_ratchetPriv`. Verified with 7 new unit tests covering the walk,
 fall-back, enforce, and ratchet-id-receiver paths.
 
-### 4. LXMF: sender doesn't check receiver `delivery_per_transfer_limit`  *(known: Finding #2)*
+### 4. ~~LXMF: delivery_per_transfer_limit not enforced~~ — FIXED
 
-Already tracked in `docs/resource-transfer-issues.md`. Short version: Python
-LXMF rejects oversize resources with RCL (which the Link layer now handles
-correctly as of 9180b98), but the fail-fast path — parsing the receiver's
-advertised limit out of their LXMF announce app_data and erroring before even
-opening the link — is not implemented. Also, JS's own announce doesn't include
-its delivery_limit, so Python peers sending to JS can't fail-fast either.
+JS now enforces `DELIVERY_LIMIT` on the receiver side (matching Python's
+`delivery_resource_advertised` callback), using the new Link
+`resource_strategy` infrastructure (gap #9). When a delivery link is
+established, LXMRouter sets `ACCEPT_APP` with a callback that checks
+`adv.dataSize` against `this.deliveryPerTransferLimit * 1000`. Oversize
+resources are rejected via RCL, which the sender handles immediately.
 
-**Files**: `src/lxmf/LXMRouter.js` — both sides (`handleOutbound` and
-`announceDelivery`).
+Note: Python also doesn't broadcast `delivery_per_transfer_limit` in
+delivery announces (only `[displayName, stampCost]`), so there's no
+sender-side fail-fast on either platform — the limit is enforced only on
+the receiver via the resource strategy callback.
 
 ### 5. LXMF propagation peering subsystem absent  *(feature)*
 
@@ -175,27 +177,27 @@ Rolled into the watchdog fix above. `ResourceSender.handleRequest()` now
 transitions to `RESOURCE_AWAITING_PROOF` when `sentParts >= totalParts`, and
 the watchdog enforces `PROOF_TIMEOUT_FACTOR * rtt + SENDER_GRACE_TIME`.
 
-### 8. Transport: no `random_blobs` list per path  *(replay-window)*
+### 8. ~~Transport: no `random_blobs` list per path~~ — FIXED
 
-**Impact**: Python stores the last N `random_blobs` per path entry
-(`IDX_PT_RANDBLOBS`) so it can compute `timebase_from_random_blobs` and reject
-replayed announces. JS parses the current `random_blob` from each announce but
-doesn't retain history.
+Path table entries now carry a `randomBlobs` array (capped at 64, matching
+Python `MAX_RANDOM_BLOBS`). On each announce, the blob is checked against
+the existing list — if already seen, the announce is rejected as a replay.
+New blobs are appended and the list is capped. Also added
+`_timebaseFromBlobs()` which extracts the max emission timestamp from the
+blob list (matching Python `timebase_from_random_blobs`), used to compare
+whether a new announce is actually more recent than the current best path.
 
-**Files**: `src/Transport.js:validateAnnounce` and announce table schema.
+### 9. ~~Link: no `resource_strategy` filtering~~ — FIXED
 
-**Fix shape**: widen the announce-table entry to carry a bounded list of recent
-blobs, add Python's replay check.
+Added `ACCEPT_NONE` (default), `ACCEPT_APP`, `ACCEPT_ALL` constants and
+`setResourceStrategy()` / `setResourceCallback()` methods matching Python
+`RNS/Link.py:120-122,1296`. `_handleResourceAdv` now dispatches:
+- `ACCEPT_NONE` → silently ignore
+- `ACCEPT_APP` → call callback with `{dataSize, totalParts, hash, link}`;
+  return true to accept, false to reject (sends RCL)
+- `ACCEPT_ALL` → auto-accept
 
-### 9. Link: no `resource_strategy` filtering  *(feature)*
-
-**Impact**: JS auto-accepts every inbound resource. Python supports
-`ACCEPT_NONE`, `ACCEPT_APP` (callback), `ACCEPT_ALL`. LXMF uses ACCEPT_APP to
-enforce its delivery limit. JS has no equivalent, so even if JS implements
-Finding #2 above, a hostile peer can still burn bandwidth by sending resources
-that the JS application doesn't want.
-
-**Files**: `src/Link.js:_handleResourceAdv`.
+LXMF uses `ACCEPT_APP` for delivery links (gap #4).
 
 ### 10. Link: no RequestReceipt API  *(feature)*
 
