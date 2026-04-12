@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { Destination } from '../src/Destination.js';
+import { Destination, RATCHET_INTERVAL, RATCHET_COUNT } from '../src/Destination.js';
 import { Identity } from '../src/Identity.js';
+import { Storage } from '../src/utils/storage.js';
+import { MemoryBackend } from '../src/utils/storage-backend.js';
 import { truncatedHash } from '../src/utils/crypto.js';
 import { concat, fromUtf8, toHex, equal } from '../src/utils/bytes.js';
 import {
@@ -104,6 +106,129 @@ describe('Destination', () => {
       const dest = new Destination(id, DEST_IN, DEST_SINGLE, 'myapp', 'endpoint');
       const computed = Destination.computeHash(dest.nameHash, id.hash);
       expect(equal(computed, dest.hash)).toBe(true);
+    });
+  });
+
+  describe('ratchets', () => {
+    async function makeStorage() {
+      const storage = new Storage(new MemoryBackend());
+      await storage.init();
+      return storage;
+    }
+
+    it('RATCHET_INTERVAL and RATCHET_COUNT match Python defaults', () => {
+      expect(RATCHET_INTERVAL).toBe(30 * 60);
+      expect(RATCHET_COUNT).toBe(512);
+    });
+
+    it('enableRatchets initializes an empty ratchet list on first use', async () => {
+      const id = Identity.generate();
+      const dest = new Destination(id, DEST_IN, DEST_SINGLE, 'myapp', 'endpoint');
+      const storage = await makeStorage();
+      await dest.enableRatchets(`storage/ratchets/${dest.hexHash}`, storage);
+      expect(dest.ratchets).toEqual([]);
+      expect(dest.currentRatchetPub()).toBeNull();
+    });
+
+    it('rotateRatchets generates a new ratchet on first call', async () => {
+      const id = Identity.generate();
+      const dest = new Destination(id, DEST_IN, DEST_SINGLE, 'myapp', 'endpoint');
+      const storage = await makeStorage();
+      await dest.enableRatchets(`storage/ratchets/${dest.hexHash}`, storage);
+
+      const pub = await dest.rotateRatchets();
+      expect(pub).toBeInstanceOf(Uint8Array);
+      expect(pub).toHaveLength(32);
+      expect(dest.ratchets).toHaveLength(1);
+    });
+
+    it('rotateRatchets skips rotation within the interval', async () => {
+      const id = Identity.generate();
+      const dest = new Destination(id, DEST_IN, DEST_SINGLE, 'myapp', 'endpoint');
+      const storage = await makeStorage();
+      await dest.enableRatchets(`storage/ratchets/${dest.hexHash}`, storage);
+
+      const pub1 = await dest.rotateRatchets();
+      const pub2 = await dest.rotateRatchets();
+      expect(equal(pub1, pub2)).toBe(true);
+      expect(dest.ratchets).toHaveLength(1);
+    });
+
+    it('rotateRatchets rotates once the interval elapses', async () => {
+      const id = Identity.generate();
+      const dest = new Destination(id, DEST_IN, DEST_SINGLE, 'myapp', 'endpoint');
+      const storage = await makeStorage();
+      await dest.enableRatchets(`storage/ratchets/${dest.hexHash}`, storage);
+      dest.setRatchetInterval(1); // 1 second
+
+      const pub1 = await dest.rotateRatchets();
+      // Fake the interval by rewinding latestRatchetTime
+      dest._latestRatchetTime -= 2;
+      const pub2 = await dest.rotateRatchets();
+      expect(equal(pub1, pub2)).toBe(false);
+      expect(dest.ratchets).toHaveLength(2);
+      // Newest entry sits at the front
+      expect(equal(Identity.ratchetPublicBytes(dest.ratchets[0]), pub2)).toBe(true);
+    });
+
+    it('persists and reloads the ratchet list across instances', async () => {
+      const id = Identity.generate();
+      const d1 = new Destination(id, DEST_IN, DEST_SINGLE, 'myapp', 'endpoint');
+      const storage = await makeStorage();
+      const key = `storage/ratchets/${d1.hexHash}`;
+      await d1.enableRatchets(key, storage);
+      await d1.rotateRatchets();
+      d1._latestRatchetTime -= 10000; // allow immediate re-rotation
+      await d1.rotateRatchets();
+      const originalRatchets = d1.ratchets.map((r) => new Uint8Array(r));
+
+      // Fresh instance with same identity should reload the same list
+      const d2 = new Destination(id, DEST_IN, DEST_SINGLE, 'myapp', 'endpoint');
+      await d2.enableRatchets(key, storage);
+      expect(d2.ratchets).toHaveLength(originalRatchets.length);
+      for (let i = 0; i < originalRatchets.length; i++) {
+        expect(equal(d2.ratchets[i], originalRatchets[i])).toBe(true);
+      }
+    });
+
+    it('setRetainedRatchets trims excess ratchets', async () => {
+      const id = Identity.generate();
+      const dest = new Destination(id, DEST_IN, DEST_SINGLE, 'myapp', 'endpoint');
+      const storage = await makeStorage();
+      await dest.enableRatchets(`storage/ratchets/${dest.hexHash}`, storage);
+      // Manually stuff the list
+      dest.ratchets = [
+        Identity.generateRatchet(), Identity.generateRatchet(), Identity.generateRatchet(),
+      ];
+      dest.setRetainedRatchets(2);
+      expect(dest.ratchets).toHaveLength(2);
+    });
+
+    it('end-to-end: encrypt to current ratchet pub, decrypt via enabled ratchets', async () => {
+      const id = Identity.generate();
+      const dest = new Destination(id, DEST_IN, DEST_SINGLE, 'myapp', 'endpoint');
+      const storage = await makeStorage();
+      await dest.enableRatchets(`storage/ratchets/${dest.hexHash}`, storage);
+      const pub = await dest.rotateRatchets();
+
+      // A sender encrypts to that ratchet public key.
+      const ct = await id.encrypt(fromUtf8('secret'), pub);
+      // The destination's identity decrypts with the list of private ratchets.
+      const pt = await id.decrypt(ct, { ratchets: dest.ratchets });
+      expect(equal(pt, fromUtf8('secret'))).toBe(true);
+    });
+
+    it('rejects a ratchet file whose signature does not verify', async () => {
+      const id = Identity.generate();
+      const other = Identity.generate();
+      const dest = new Destination(id, DEST_IN, DEST_SINGLE, 'myapp', 'endpoint');
+      const storage = await makeStorage();
+      const key = `storage/ratchets/${dest.hexHash}`;
+
+      // Persist under `other` so the signature is wrong for `id`
+      await storage.saveDestinationRatchets(key, [Identity.generateRatchet()], other);
+
+      await expect(dest.enableRatchets(key, storage)).rejects.toThrow(/signature/);
     });
   });
 });

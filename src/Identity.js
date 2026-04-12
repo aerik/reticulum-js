@@ -216,6 +216,125 @@ export class Identity {
     this._ratchetPub = pubKey;
   }
 
+  // --- Static known-ratchets store ---
+  //
+  // Mirrors Python's class-level `Identity.known_ratchets` dict
+  // (RNS/Identity.py:94). Maps a remote destination hash (hex) to the most
+  // recently advertised ratchet public key for that destination, so outgoing
+  // packets to that destination can be encrypted with its current ratchet
+  // instead of the base key. Entries expire after RATCHET_EXPIRY.
+
+  /**
+   * Generate a fresh ratchet private key (32-byte X25519 scalar).
+   * Matches Python `Identity._generate_ratchet` in RNS/Identity.py:290.
+   * @returns {Uint8Array}
+   */
+  static generateRatchet() {
+    return generateX25519Keypair().privateKey;
+  }
+
+  /**
+   * Derive the ratchet public key from its private bytes.
+   * Matches Python `Identity._ratchet_public_bytes` in RNS/Identity.py:287.
+   * @param {Uint8Array} ratchetPriv - 32-byte X25519 private key
+   * @returns {Uint8Array} 32-byte X25519 public key
+   */
+  static ratchetPublicBytes(ratchetPriv) {
+    return _x25519.getPublicKey(ratchetPriv);
+  }
+
+  /**
+   * Remember a remote destination's current ratchet public key. If a
+   * `Storage` instance is supplied it also persists the entry so it
+   * survives restart. Matches Python `Identity._remember_ratchet` in
+   * RNS/Identity.py:296.
+   *
+   * @param {Uint8Array} destinationHash - 16-byte destination hash
+   * @param {Uint8Array} ratchetPub - 32-byte X25519 public key
+   * @param {object} [options]
+   * @param {import('./utils/storage.js').Storage} [options.storage]
+   */
+  static async rememberRatchet(destinationHash, ratchetPub, options = {}) {
+    if (!ratchetPub || ratchetPub.length !== 32) return false;
+    const hexHash = toHex(destinationHash);
+    const existing = Identity._knownRatchets.get(hexHash);
+    if (existing && equal(existing.ratchet, ratchetPub)) return true;
+
+    const entry = { ratchet: new Uint8Array(ratchetPub), received: Date.now() / 1000 };
+    Identity._knownRatchets.set(hexHash, entry);
+
+    if (options.storage && typeof options.storage.saveRemoteRatchet === 'function') {
+      try {
+        await options.storage.saveRemoteRatchet(hexHash, entry);
+      } catch (err) {
+        // Best-effort — in-memory entry is still valid.
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Look up a remote destination's current ratchet public key. On a cache
+   * miss, tries to load from the supplied Storage. Returns null if the
+   * entry is unknown or has exceeded RATCHET_EXPIRY.
+   * Matches Python `Identity.get_ratchet` in RNS/Identity.py:365.
+   *
+   * @param {Uint8Array} destinationHash - 16-byte destination hash
+   * @param {object} [options]
+   * @param {import('./utils/storage.js').Storage} [options.storage]
+   * @returns {Promise<Uint8Array|null>}
+   */
+  static async getRatchet(destinationHash, options = {}) {
+    const hexHash = toHex(destinationHash);
+    const now = Date.now() / 1000;
+
+    let entry = Identity._knownRatchets.get(hexHash);
+    if (!entry && options.storage && typeof options.storage.loadRemoteRatchet === 'function') {
+      try {
+        entry = await options.storage.loadRemoteRatchet(hexHash);
+        if (entry) Identity._knownRatchets.set(hexHash, entry);
+      } catch {
+        // Fall through — no cached entry
+      }
+    }
+    if (!entry) return null;
+    if (now - entry.received > Identity.RATCHET_EXPIRY) {
+      Identity._knownRatchets.delete(hexHash);
+      return null;
+    }
+    return entry.ratchet;
+  }
+
+  /**
+   * Drop expired entries from the in-memory known-ratchets map. If a
+   * Storage instance is supplied it also asks the backend to clean up
+   * persisted entries. Matches Python `Identity._clean_ratchets` in
+   * RNS/Identity.py:333.
+   *
+   * @param {object} [options]
+   * @param {import('./utils/storage.js').Storage} [options.storage]
+   */
+  static async cleanRatchets(options = {}) {
+    const now = Date.now() / 1000;
+    for (const [hex, entry] of Identity._knownRatchets) {
+      if (now - entry.received > Identity.RATCHET_EXPIRY) {
+        Identity._knownRatchets.delete(hex);
+      }
+    }
+    if (options.storage && typeof options.storage.cleanRemoteRatchets === 'function') {
+      try {
+        await options.storage.cleanRemoteRatchets(Identity.RATCHET_EXPIRY);
+      } catch {
+        // Best-effort
+      }
+    }
+  }
+
+  /** Reset the in-memory known ratchets map (primarily for tests). */
+  static _resetKnownRatchets() {
+    Identity._knownRatchets.clear();
+  }
+
   /**
    * Encrypt plaintext for this identity (as recipient).
    *
@@ -388,6 +507,20 @@ export class Identity {
     return aesCbcDecrypt(ciphertext, encryptionKey, iv);
   }
 }
+
+// Static class state — mirrors Python Identity.RATCHET_EXPIRY / known_ratchets.
+/**
+ * Maximum age of a remembered remote ratchet public key in seconds.
+ * Matches Python `Identity.RATCHET_EXPIRY` in RNS/Identity.py:69 (30 days).
+ */
+Identity.RATCHET_EXPIRY = 30 * 24 * 60 * 60;
+
+/**
+ * Class-level cache mapping remote destination hash (hex) to
+ * `{ ratchet: Uint8Array, received: number }`. Mirrors Python
+ * `Identity.known_ratchets` in RNS/Identity.py:94.
+ */
+Identity._knownRatchets = new Map();
 
 // Imported for fromPrivateKey() to derive public keys from private keys.
 import { x25519 as _x25519, ed25519 as _ed25519 } from '@noble/curves/ed25519.js';

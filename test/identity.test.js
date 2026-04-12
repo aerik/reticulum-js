@@ -217,6 +217,86 @@ describe('Identity', () => {
     });
   });
 
+  describe('static known-ratchet store', () => {
+    // These exercise the class-level known_ratchets store that Transport uses
+    // to remember remote destinations' advertised ratchets. Mirrors Python
+    // `Identity.known_ratchets` + `_remember_ratchet` / `get_ratchet` /
+    // `_clean_ratchets` in RNS/Identity.py:94-363.
+
+    it('generateRatchet returns 32-byte X25519 private bytes', () => {
+      const priv = Identity.generateRatchet();
+      expect(priv).toBeInstanceOf(Uint8Array);
+      expect(priv).toHaveLength(32);
+    });
+
+    it('ratchetPublicBytes derives a matching public key', () => {
+      const priv = Identity.generateRatchet();
+      const pub = Identity.ratchetPublicBytes(priv);
+      expect(pub).toHaveLength(32);
+      // Encrypting to the derived pub and decrypting with the priv should
+      // round-trip through _decryptWith().
+      const recipient = Identity.generate();
+      return recipient.encrypt(fromUtf8('roundtrip'), pub).then(async (ct) => {
+        const pt = await recipient.decrypt(ct, { ratchets: [priv] });
+        expect(equal(pt, fromUtf8('roundtrip'))).toBe(true);
+      });
+    });
+
+    it('remembers and recalls a remote ratchet', async () => {
+      Identity._resetKnownRatchets();
+      const destHash = new Uint8Array(16);
+      for (let i = 0; i < 16; i++) destHash[i] = i;
+      const pub = Identity.ratchetPublicBytes(Identity.generateRatchet());
+
+      await Identity.rememberRatchet(destHash, pub);
+      const recalled = await Identity.getRatchet(destHash);
+      expect(recalled).toBeInstanceOf(Uint8Array);
+      expect(equal(recalled, pub)).toBe(true);
+    });
+
+    it('returns null for an unknown destination', async () => {
+      Identity._resetKnownRatchets();
+      const destHash = new Uint8Array(16);
+      destHash[0] = 0xAB;
+      const recalled = await Identity.getRatchet(destHash);
+      expect(recalled).toBeNull();
+    });
+
+    it('expires a ratchet older than RATCHET_EXPIRY', async () => {
+      Identity._resetKnownRatchets();
+      const destHash = new Uint8Array(16);
+      destHash[0] = 0xCD;
+      const pub = Identity.ratchetPublicBytes(Identity.generateRatchet());
+
+      await Identity.rememberRatchet(destHash, pub);
+      // Rewind the entry's `received` timestamp into the distant past.
+      const hex = [...destHash].map((b) => b.toString(16).padStart(2, '0')).join('');
+      const entry = Identity._knownRatchets.get(hex);
+      entry.received -= Identity.RATCHET_EXPIRY + 1;
+
+      const recalled = await Identity.getRatchet(destHash);
+      expect(recalled).toBeNull();
+      // Also evicted from the in-memory map
+      expect(Identity._knownRatchets.has(hex)).toBe(false);
+    });
+
+    it('cleanRatchets drops expired entries in-memory', async () => {
+      Identity._resetKnownRatchets();
+      const fresh = new Uint8Array(16); fresh[0] = 1;
+      const stale = new Uint8Array(16); stale[0] = 2;
+      await Identity.rememberRatchet(fresh, Identity.ratchetPublicBytes(Identity.generateRatchet()));
+      await Identity.rememberRatchet(stale, Identity.ratchetPublicBytes(Identity.generateRatchet()));
+
+      // Age out the stale entry
+      const staleHex = '02' + '00'.repeat(15);
+      Identity._knownRatchets.get(staleHex).received -= Identity.RATCHET_EXPIRY + 1;
+
+      await Identity.cleanRatchets();
+      expect(Identity._knownRatchets.has(staleHex)).toBe(false);
+      expect(Identity._knownRatchets.size).toBe(1);
+    });
+  });
+
   describe('exportPrivateKey / fromPrivateKey', () => {
     it('exports 64-byte private key', () => {
       const id = Identity.generate();

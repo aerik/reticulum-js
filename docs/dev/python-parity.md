@@ -46,8 +46,8 @@ load or against adversarial peers.
 | File pair | Parity | Verdict |
 |-----------|-------:|---------|
 | `Packet.js` ↔ `RNS/Packet.py` | ~85% | Wire format matches; `pack()` doesn't encrypt (callers do it); no `PacketReceipt`/`ProofDestination`; LRPROOF special-case not in Packet itself (Link handles it). |
-| `Identity.js` ↔ `RNS/Identity.py` | ~80% | Crypto primitives match exactly (HKDF/AES/Ed25519/X25519). Multi-ratchet decrypt now matches Python (see gap #3). Announce validation lives in `Announce.js` not Identity. No `recall()`/`remember()` (uses `Transport.announceTable`). |
-| `Destination.js` ↔ `RNS/Destination.py` | ~40% | Skeleton: hash, callbacks, name expansion. `announce()` is in `src/Announce.js` (architectural split). **No ratchet management**, **no request handlers**, **no `encrypt()`/`decrypt()` dispatch**, **no `incoming_link_request()`**, **no GROUP destination support**. |
+| `Identity.js` ↔ `RNS/Identity.py` | ~90% | Crypto primitives, multi-ratchet decrypt, and class-level known-ratchets store (remember/recall/clean + RATCHET_EXPIRY) all match Python. Announce validation lives in `Announce.js`, known-destinations in `Transport.announceTable`. |
+| `Destination.js` ↔ `RNS/Destination.py` | ~60% | Hash, callbacks, name expansion, and full ratchet management (rotation, persistence, enforce, retained count, interval) now match Python. `announce()` is in `src/Announce.js` (architectural split). Still missing: request handlers, `encrypt()`/`decrypt()` dispatch, `incoming_link_request()`, GROUP destination support. |
 | `Link.js` ↔ `RNS/Link.py` | ~85% | Handshake, encryption, watchdog, STALE/TIMEOUT, RCL/ICL/PRF dispatch all correct. Missing: `RequestReceipt` API, resource strategy, MDU calc, mode negotiation, Channel, physical stats, `identify()`. |
 | `Resource.js` ↔ `RNS/Resource.py` | ~85% | Advertisement/parts/HMU/proof, watchdog/retry loop, and AWAITING_PROOF state all match. Still missing: adaptive window tuning (EIFR-based), multi-segment, auto-compression, metadata, input_file streaming. Status enum now matches Python numbering except REJECTED. |
 | `Transport.js` ↔ `RNS/Transport.py` | ~65% | Announce validation/forwarding, path table, dedup, link proof routing work. Missing: `random_blobs` list per path (replay window), path state machine, tunnel mode, control destinations (blackhole/instance/network/probe), shared instance, `await_path`. Gateway/boundary/AP modes are intentional edge-only divergence. |
@@ -82,22 +82,44 @@ Simplifications vs. Python: EIFR rate-based timing is approximated with
 JS Transport has no equivalent cache; `PART_TIMEOUT_FACTOR_AFTER_RTT` switch
 is not implemented (stays at 4).
 
-### 2. Forward secrecy: no ratchet rotation or persistence  *(crypto)*
+### 2. ~~Forward secrecy: no ratchet rotation or persistence~~ — FIXED
 
-**Impact**: JS reads ratchet pubkeys out of announces and can encrypt *to* a
-ratcheted peer, but never rotates its own ratchet, never persists ratchet keys
-across restarts, and has no `enforce_ratchets` mode. Every restart = same base
-key forever. A compromise of the base private key decrypts all past traffic.
+Port of Python's two-layer ratchet model:
 
-**Files**: `src/Identity.js` has `rotateRatchet()` as a manual instance method
-only. `src/Destination.js` has no `enable_ratchets()`, `set_ratchet_interval()`,
-or `_persist_ratchets()`. No `known_ratchets` static store anywhere.
+**Destination-owned private ratchets** (`src/Destination.js`): new
+`enableRatchets(storageKey, storage)`, `rotateRatchets()`,
+`_persistRatchets()`, `_reloadRatchets()`, `enforceRatchets()`,
+`setRetainedRatchets(n)`, `setRatchetInterval(s)`, plus `RATCHET_INTERVAL=30min`
+and `RATCHET_COUNT=512` constants. Persisted list is signed with the
+destination identity and verified on reload, matching Python
+`RNS/Destination.py:205-540`.
 
-**Fix shape**: port Python's `Destination.enable_ratchets()` +
-`rotate_ratchets()` + `_persist_ratchets()` (uses umsgpack to
-`storage/ratchets/{hash}`), plus the 30-day `RATCHET_EXPIRY`. Wire
-`rotate_ratchets()` into the announce path so each announce carries a fresh
-ratchet when due.
+**Identity class-level remote ratchets** (`src/Identity.js`):
+`Identity.generateRatchet()`, `Identity.ratchetPublicBytes(priv)`,
+`Identity.rememberRatchet(destHash, pub, {storage})`,
+`Identity.getRatchet(destHash, {storage})`,
+`Identity.cleanRatchets({storage})`, plus `Identity._knownRatchets` Map and
+`Identity.RATCHET_EXPIRY = 30 days`. Mirrors Python
+`RNS/Identity.py:94-363`.
+
+**Persistence** (`src/utils/storage.js`): `saveDestinationRatchets` /
+`loadDestinationRatchets` (signed envelope), `saveRemoteRatchet` /
+`loadRemoteRatchet` / `cleanRemoteRatchets`.
+
+**Announce wiring** (`src/Transport.js`): `_handleAnnounce` now calls
+`Identity.rememberRatchet(destHash, ratchet)` when the validated announce
+carries a ratchet.
+
+Verified by 16 new unit tests covering: generate/publicBytes, remember/recall
+round-trip, expiry, clean, destination rotate-skip-within-interval,
+rotate-after-interval, persist+reload across instances, retain trim,
+signature rejection, and a full end-to-end `announce → rememberRatchet →
+getRatchet → encrypt → decrypt` loop.
+
+Still not implemented from Python (intentional simplifications): file-scan
+`_clean_ratchets` walks globally-persisted remote files (per-destination
+API is sufficient for the current use); threading lock on ratchet file
+writes (single-threaded JS).
 
 ### 3. ~~Identity.decrypt() tries only one ratchet~~ — FIXED
 

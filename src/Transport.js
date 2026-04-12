@@ -334,7 +334,15 @@ export class Transport extends EventEmitter {
 
     this.stats.announcesValidated++;
 
-    const { identity, nameHash, randomBlob, appData, timestamp, destinationHash } = result;
+    const { identity, nameHash, randomBlob, ratchet, appData, timestamp, destinationHash } = result;
+
+    // Remember the remote ratchet (if any) so later outgoing packets to
+    // this destination can encrypt to it. Matches Python Transport
+    // announce handler calling `Identity._remember_ratchet` after validation.
+    if (ratchet) {
+      Identity.rememberRatchet(destinationHash, ratchet, { storage: this.storage })
+        .catch((err) => log(LOG_WARNING, TAG, `Failed to remember ratchet: ${err.message}`));
+    }
 
     // Check if we should accept this announce (compare with existing path)
     const existing = this.pathTable.get(destHex);

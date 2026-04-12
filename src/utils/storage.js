@@ -312,6 +312,126 @@ export class Storage {
     log(LOG_INFO, TAG, `Pruned announce cache: removed ${toRemove} entries (${keys.length} → ${maxEntries})`);
   }
 
+  // --- Destination-owned ratchet lists ---
+  //
+  // Mirrors Python's per-destination ratchet file in
+  // RNS/Destination.py:210 (_persist_ratchets) and :437 (_reload_ratchets).
+  // Stored as a msgpack-packed `{signature, ratchets}` blob signed with the
+  // destination's identity so the loader can verify authenticity.
+
+  /**
+   * Persist a destination's list of private ratchet keys, signed by the
+   * destination identity.
+   * @param {string} key - Storage key (e.g. "storage/ratchets/<hexhash>")
+   * @param {Uint8Array[]} ratchets - List of 32-byte X25519 private keys
+   * @param {import('../Identity.js').Identity} identity - Signer
+   */
+  async saveDestinationRatchets(key, ratchets, identity) {
+    const packedRatchets = new Uint8Array(msgpackEncode(ratchets.map((r) => Array.from(r))));
+    const signature = identity.sign(packedRatchets);
+    const envelope = {
+      signature: Array.from(signature),
+      ratchets: Array.from(packedRatchets),
+    };
+    const packed = new Uint8Array(msgpackEncode(envelope));
+    await this.backend.set(key, packed);
+    log(LOG_DEBUG, TAG, `Saved ${ratchets.length} destination ratchets to ${key}`);
+  }
+
+  /**
+   * Load a destination's ratchet list and verify the signature against the
+   * supplied identity.
+   * @param {string} key - Storage key
+   * @param {import('../Identity.js').Identity} identity - Expected signer
+   * @returns {Promise<Uint8Array[]|null>} list of 32-byte private keys, or
+   *   null if no file exists
+   * @throws if the file is present but the signature is invalid
+   */
+  async loadDestinationRatchets(key, identity) {
+    const data = await this.backend.get(key);
+    if (!data) return null;
+    const envelope = msgpackDecode(data);
+    if (!envelope || !envelope.signature || !envelope.ratchets) {
+      throw new Error('Ratchet file is missing signature or ratchets field');
+    }
+    const signature = new Uint8Array(envelope.signature);
+    const packedRatchets = new Uint8Array(envelope.ratchets);
+    if (!identity.verify(packedRatchets, signature)) {
+      throw new Error('Ratchet file signature is invalid');
+    }
+    const decoded = msgpackDecode(packedRatchets);
+    if (!Array.isArray(decoded)) return [];
+    return decoded.map((r) => new Uint8Array(r));
+  }
+
+  // --- Remote-ratchet cache (Identity.known_ratchets) ---
+  //
+  // Mirrors Python's per-destination file under `<storagepath>/ratchets/<hexhash>`
+  // in RNS/Identity.py:296-330. One file per remote destination, each
+  // containing `{ratchet, received}`.
+
+  /**
+   * Persist a single remote destination's current ratchet public key.
+   * @param {string} destHex - Hex of the destination hash
+   * @param {{ratchet: Uint8Array, received: number}} entry
+   */
+  async saveRemoteRatchet(destHex, entry) {
+    const packed = new Uint8Array(msgpackEncode({
+      ratchet: Array.from(entry.ratchet),
+      received: entry.received,
+    }));
+    await this.backend.set(`storage/known_ratchets/${destHex}`, packed);
+  }
+
+  /**
+   * Load a single remote destination's ratchet entry, or null.
+   * @param {string} destHex
+   * @returns {Promise<{ratchet: Uint8Array, received: number}|null>}
+   */
+  async loadRemoteRatchet(destHex) {
+    const data = await this.backend.get(`storage/known_ratchets/${destHex}`);
+    if (!data) return null;
+    try {
+      const decoded = msgpackDecode(data);
+      if (!decoded || !decoded.ratchet || typeof decoded.received !== 'number') return null;
+      return {
+        ratchet: new Uint8Array(decoded.ratchet),
+        received: decoded.received,
+      };
+    } catch (err) {
+      log(LOG_WARNING, TAG, `Failed to parse known_ratchet for ${destHex}: ${err.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Remove expired remote-ratchet entries. Called periodically (or at
+   * startup) to keep the store bounded.
+   * @param {number} expirySec - max age in seconds
+   */
+  async cleanRemoteRatchets(expirySec) {
+    const prefix = 'storage/known_ratchets/';
+    const keys = await this.backend.list(prefix);
+    const now = Date.now() / 1000;
+    let removed = 0;
+    for (const key of keys) {
+      try {
+        const data = await this.backend.get(key);
+        if (!data) continue;
+        const decoded = msgpackDecode(data);
+        if (!decoded || typeof decoded.received !== 'number' ||
+            now - decoded.received > expirySec) {
+          await this.backend.delete(key);
+          removed++;
+        }
+      } catch {
+        await this.backend.delete(key);
+        removed++;
+      }
+    }
+    if (removed > 0) log(LOG_DEBUG, TAG, `Removed ${removed} expired remote ratchets`);
+  }
+
   // --- Packet Hashlist ---
 
   async saveHashlist(hashlist) {

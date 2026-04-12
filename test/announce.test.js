@@ -103,6 +103,41 @@ describe('Announce', () => {
       expect(equal(result.appData, appData)).toBe(true);
     });
 
+    it('round-trips a ratcheted announce and remembers the ratchet', async () => {
+      // Simulates: destination with rotated ratchet → announce out → peer
+      // validates → Transport-style rememberRatchet → getRatchet recalls.
+      Identity._resetKnownRatchets();
+      const id = Identity.generate();
+      const dest = new Destination(id, DEST_IN, DEST_SINGLE, 'app', 'svc');
+
+      // Generate a ratchet keypair manually (like Destination.rotateRatchets
+      // would, but inline so the test doesn't need a Storage setup)
+      const ratchetPriv = Identity.generateRatchet();
+      const ratchetPub = Identity.ratchetPublicBytes(ratchetPriv);
+
+      const pkt = createAnnounce(dest, null, { ratchet: ratchetPub });
+      const parsed = Packet.parse(pkt.pack());
+      const result = validateAnnounce(parsed);
+
+      expect(result).not.toBeNull();
+      expect(result.ratchet).not.toBeNull();
+      expect(equal(result.ratchet, ratchetPub)).toBe(true);
+
+      // Transport-equivalent remember step
+      await Identity.rememberRatchet(result.destinationHash, result.ratchet);
+
+      // Later, when we want to encrypt *to* that destination, we look up
+      // the remembered ratchet and pass it to `identity.encrypt`.
+      const recalled = await Identity.getRatchet(dest.hash);
+      expect(recalled).not.toBeNull();
+      expect(equal(recalled, ratchetPub)).toBe(true);
+
+      // Full E2E: encrypt with recalled ratchet, decrypt with the private ratchet
+      const ct = await id.encrypt(fromUtf8('hi'), recalled);
+      const pt = await id.decrypt(ct, { ratchets: [ratchetPriv] });
+      expect(equal(pt, fromUtf8('hi'))).toBe(true);
+    });
+
     it('timestamp is close to creation time', () => {
       const id = Identity.generate();
       const dest = new Destination(id, DEST_IN, DEST_SINGLE, 'app');
