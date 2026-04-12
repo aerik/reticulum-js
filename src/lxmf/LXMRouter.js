@@ -24,9 +24,10 @@ import {
   DIRECT, PROPAGATED, OPPORTUNISTIC,
   OUTBOUND, SENDING, SENT, DELIVERED, FAILED,
 } from './LXMessage.js';
+import { LXMPeer } from './LXMPeer.js';
 import { APP_NAME, MESSAGE_GET_PATH, MESSAGE_EXPIRY,
          ERROR_NO_IDENTITY, ERROR_NO_ACCESS, PROPAGATION_LIMIT,
-         DELIVERY_LIMIT } from './constants.js';
+         DELIVERY_LIMIT, STRATEGY_PERSISTENT, PN_META_NAME } from './constants.js';
 import { sha256Hash, truncatedHash } from '../utils/crypto.js';
 import { concat, toHex, equal, fromUtf8 } from '../utils/bytes.js';
 import { log, LOG_DEBUG, LOG_INFO, LOG_WARNING, LOG_ERROR } from '../utils/log.js';
@@ -85,6 +86,19 @@ export class LXMRouter extends EventEmitter {
     // Callbacks
     this._messageCallback = null;
     this._deliveryCallbacks = new Map(); // destHashHex → callback
+
+    // Peering configuration — matches Python LXMRouter.py constructor
+    this.autopeer = options.autopeer !== undefined ? options.autopeer : true;
+    this.autopeerMaxdepth = options.autopeerMaxdepth || 4;
+    this.maxPeers = options.maxPeers || 6;
+    this.maxPeeringCost = options.maxPeeringCost != null ? options.maxPeeringCost : 255;
+    this.defaultSyncStrategy = options.syncStrategy || STRATEGY_PERSISTENT;
+    this.propagationPerTransferLimit = options.propagationTransferLimit || PROPAGATION_LIMIT;
+    this.propagationPerSyncLimit = options.propagationSyncLimit || (PROPAGATION_LIMIT * 40);
+    this.propagationStampCost = options.propagationStampCost || 0;
+    this.propagationStampCostFlexibility = options.propagationStampCostFlexibility || 0;
+    this.peeringCost = options.peeringCost || 0;
+    this.nodeName = options.nodeName || null;
 
     // Peering state — matches Python LXMRouter peers dict
     this.peers = new Map();              // destHashHex → LXMPeer
@@ -205,16 +219,29 @@ export class LXMRouter extends EventEmitter {
   /**
    * Announce the propagation destination.
    */
+  /**
+   * Build the propagation node announce metadata dict.
+   * Matches Python `get_propagation_node_announce_metadata()`.
+   */
+  _getPropagationMetadata() {
+    const metadata = {};
+    if (this.nodeName) metadata[PN_META_NAME] = new TextEncoder().encode(this.nodeName);
+    return metadata;
+  }
+
   announcePropagation() {
     if (!this.propagationDestination) return;
+    const metadata = this._getPropagationMetadata();
     const appData = new Uint8Array(msgpackEncode([
-      null,   // peering key
-      0,      // timebase
-      true,   // propagation enabled
-      PROPAGATION_LIMIT, // transfer limit KB
-      PROPAGATION_LIMIT * 40, // sync limit KB
-      [0, 0, 0], // [stamp_cost, flexibility, peering_cost]
-      {},     // metadata
+      false,                                    // 0: legacy LXMF PN support flag
+      Math.floor(Date.now() / 1000),            // 1: current node timebase
+      this.propagationNode,                     // 2: propagation enabled
+      this.propagationPerTransferLimit,         // 3: per-transfer limit KB
+      this.propagationPerSyncLimit,             // 4: sync limit KB
+      [this.propagationStampCost,               // 5: [stamp_cost, flexibility, peering_cost]
+       this.propagationStampCostFlexibility,
+       this.peeringCost],
+      metadata,                                 // 6: node metadata
     ]));
     const pkt = createAnnounce(this.propagationDestination, appData);
     this.transport.transmit(pkt);
@@ -1096,7 +1123,171 @@ export class LXMRouter extends EventEmitter {
       return true;
     });
 
+    // Subscribe to transport announces for auto-peering. We only peer with
+    // other propagation nodes, identified by their app_data format.
+    if (!this._propagationAnnounceHandlerAttached) {
+      this.transport.on('announce', (info) => this._handlePropagationAnnounce(info));
+      this._propagationAnnounceHandlerAttached = true;
+    }
+
     log(LOG_INFO, TAG, `Propagation node enabled: ${toHex(this.propagationDestination.hash)}`);
+  }
+
+  /**
+   * Handle a Transport `announce` event. If the announce looks like a
+   * propagation-node announce (matches the expected app_data schema) and
+   * autopeer is enabled, call peer().
+   *
+   * Matches Python `LXMFPropagationAnnounceHandler.received_announce` in
+   * LXMF/Handlers.py.
+   */
+  _handlePropagationAnnounce(info) {
+    if (!this.propagationNode || !this.autopeer) return;
+    if (!info || !info.appData) return;
+
+    // Don't peer with ourselves
+    if (this.propagationDestination && equal(info.destinationHash, this.propagationDestination.hash)) {
+      return;
+    }
+
+    // Respect hop depth cap
+    if (info.hops != null && info.hops > this.autopeerMaxdepth) {
+      log(LOG_DEBUG, TAG, `Announce from ${toHex(info.destinationHash).slice(0, 16)}.. ` +
+        `exceeds autopeer_maxdepth (${info.hops} > ${this.autopeerMaxdepth})`);
+      return;
+    }
+
+    let data;
+    try {
+      data = msgpackDecode(info.appData);
+    } catch {
+      return; // Not a valid msgpack app_data, not a propagation announce
+    }
+    if (!Array.isArray(data) || data.length < 7) return;
+
+    // [legacy_flag, timebase, enabled, transfer_limit, sync_limit,
+    //  [stamp_cost, flexibility, peering_cost], metadata]
+    const [, nodeTimebase, enabled, transferLimit, syncLimit, costs, metadata] = data;
+
+    if (enabled !== true) return;
+    if (!Array.isArray(costs) || costs.length < 3) return;
+
+    const propagationStampCost = Number(costs[0]);
+    const propagationStampCostFlexibility = Number(costs[1]);
+    const peeringCost = Number(costs[2]);
+
+    this.peer(
+      info.destinationHash,
+      Number(nodeTimebase),
+      Number(transferLimit),
+      syncLimit != null ? Number(syncLimit) : null,
+      propagationStampCost,
+      propagationStampCostFlexibility,
+      peeringCost,
+      metadata
+    );
+  }
+
+  /**
+   * Create or update a peering relationship. Matches Python
+   * `LXMRouter.peer()` in LXMF/LXMRouter.py:1889.
+   *
+   * - Rejects peering if peering_cost exceeds maxPeeringCost. If already
+   *   peered, breaks peering.
+   * - If peer already exists, only updates config when timestamp is newer
+   *   than the current peering_timebase.
+   * - If peer is new, enforces maxPeers cap.
+   *
+   * @param {Uint8Array} destinationHash - 16-byte peer destination hash
+   * @param {number} timestamp - Unix timestamp from the announce
+   * @param {number} propagationTransferLimit
+   * @param {number|null} propagationSyncLimit
+   * @param {number} propagationStampCost
+   * @param {number} propagationStampCostFlexibility
+   * @param {number} peeringCost
+   * @param {object} metadata
+   */
+  peer(destinationHash, timestamp, propagationTransferLimit,
+       propagationSyncLimit, propagationStampCost,
+       propagationStampCostFlexibility, peeringCost, metadata) {
+    const hexHash = toHex(destinationHash);
+
+    if (peeringCost > this.maxPeeringCost) {
+      if (this.peers.has(hexHash)) {
+        log(LOG_INFO, TAG,
+          `Peer ${hexHash.slice(0,16)}.. increased peering cost beyond local ` +
+          `maximum (${peeringCost} > ${this.maxPeeringCost}), breaking peering`);
+        this.unpeer(destinationHash, timestamp);
+      } else {
+        log(LOG_DEBUG, TAG,
+          `Not peering with ${hexHash.slice(0,16)}.. — cost ${peeringCost} ` +
+          `exceeds local max ${this.maxPeeringCost}`);
+      }
+      return;
+    }
+
+    const existing = this.peers.get(hexHash);
+    if (existing) {
+      // Only update when the announce timebase is newer (prevents rollback)
+      if (timestamp > existing.peeringTimebase) {
+        existing.alive = true;
+        existing.metadata = metadata;
+        existing.syncBackoff = 0;
+        existing.nextSyncAttempt = 0;
+        existing.peeringTimebase = timestamp;
+        existing.lastHeard = Date.now() / 1000;
+        existing.propagationStampCost = propagationStampCost;
+        existing.propagationStampCostFlexibility = propagationStampCostFlexibility;
+        existing.peeringCost = peeringCost;
+        existing.propagationTransferLimit = propagationTransferLimit;
+        existing.propagationSyncLimit = propagationSyncLimit != null
+          ? propagationSyncLimit : propagationTransferLimit;
+        log(LOG_DEBUG, TAG, `Peering config updated for ${hexHash.slice(0,16)}..`);
+      }
+      return;
+    }
+
+    if (this.peers.size >= this.maxPeers) {
+      log(LOG_DEBUG, TAG,
+        `Max peers reached (${this.maxPeers}), not peering with ${hexHash.slice(0,16)}..`);
+      return;
+    }
+
+    const peer = new LXMPeer(this, destinationHash, { syncStrategy: this.defaultSyncStrategy });
+    peer.alive = true;
+    peer.metadata = metadata;
+    peer.lastHeard = Date.now() / 1000;
+    peer.peeringTimebase = timestamp;
+    peer.propagationStampCost = propagationStampCost;
+    peer.propagationStampCostFlexibility = propagationStampCostFlexibility;
+    peer.peeringCost = peeringCost;
+    peer.propagationTransferLimit = propagationTransferLimit;
+    peer.propagationSyncLimit = propagationSyncLimit != null
+      ? propagationSyncLimit : propagationTransferLimit;
+    this.peers.set(hexHash, peer);
+    log(LOG_INFO, TAG, `Peered with ${hexHash.slice(0,16)}..`);
+    this.emit('peerAdded', peer);
+  }
+
+  /**
+   * Remove a peering relationship. Matches Python `LXMRouter.unpeer()` in
+   * LXMF/LXMRouter.py:1934. The timestamp guard prevents rollback by older
+   * announces.
+   * @param {Uint8Array} destinationHash
+   * @param {number} [timestamp]
+   */
+  unpeer(destinationHash, timestamp) {
+    if (timestamp == null) timestamp = Math.floor(Date.now() / 1000);
+    const hexHash = toHex(destinationHash);
+    const peer = this.peers.get(hexHash);
+    if (!peer) return false;
+    if (timestamp >= peer.peeringTimebase) {
+      this.peers.delete(hexHash);
+      log(LOG_INFO, TAG, `Broke peering with ${hexHash.slice(0,16)}..`);
+      this.emit('peerRemoved', peer);
+      return true;
+    }
+    return false;
   }
 
   /**
