@@ -51,7 +51,7 @@ load or against adversarial peers.
 | `Link.js` ↔ `RNS/Link.py` | ~90% | Handshake, encryption, watchdog, STALE/TIMEOUT, RCL/ICL/PRF dispatch, and resource_strategy (ACCEPT_NONE/APP/ALL) all correct. Missing: `RequestReceipt` API, MDU calc, mode negotiation, Channel, physical stats, `identify()`. |
 | `Resource.js` ↔ `RNS/Resource.py` | ~85% | Advertisement/parts/HMU/proof, watchdog/retry loop, and AWAITING_PROOF state all match. Still missing: adaptive window tuning (EIFR-based), multi-segment, auto-compression, metadata, input_file streaming. Status enum now matches Python numbering except REJECTED. |
 | `Transport.js` ↔ `RNS/Transport.py` | ~70% | Announce validation/forwarding, path table, dedup, link proof routing, and random_blob replay detection all work. Missing: path state machine, tunnel mode, control destinations (blackhole/instance/network/probe), shared instance, `await_path`. Gateway/boundary/AP modes are intentional edge-only divergence. |
-| `lxmf/LXMRouter.js` ↔ `LXMF/LXMRouter.py` | ~35% | Delivery flows (OPPORTUNISTIC/DIRECT/PROPAGATED) and basic propagation storage work. **Propagation peering subsystem entirely absent** (~40% of Python): no LXMPeer, no `peer()/unpeer()/sync_peers`, no offer protocol, no peer rotation. Also missing: message persistence (in-memory only), stamping/tickets, access control, delivery-limit broadcast in announce (Finding #2). |
+| `lxmf/LXMRouter.js` ↔ `LXMF/LXMRouter.py` | ~70% | Delivery flows, basic propagation storage, and the full peering subsystem (LXMPeer, peer()/unpeer(), auto-peering from announces, /offer handler, distribution queue, outbound sync state machine, syncPeers) all work — verified with a wired end-to-end integration test. Still missing: message store persistence (in-memory only), stamping/tickets, access control, peer rotation by acceptance rate, throttle tracking, control destination handlers. |
 | `lxmf/LXMessage.js` ↔ `LXMF/LXMessage.py` | ~90% | Wire format byte-exact. Pack/unpack/signature/hash all match. Missing only: `RENDERER_BBCODE` constant, accessor helpers (`title_as_string` etc.), paper format (`as_uri`/`as_qr`), delivery system integration (intentionally in LXMRouter). |
 
 **Interface layer** (`src/interfaces/*`): not audited. Known scope: JS has
@@ -144,20 +144,61 @@ delivery announces (only `[displayName, stampCost]`), so there's no
 sender-side fail-fast on either platform — the limit is enforced only on
 the receiver via the resource strategy callback.
 
-### 5. LXMF propagation peering subsystem absent  *(feature)*
+### 5. ~~LXMF propagation peering subsystem absent~~ — IMPLEMENTED (core phases)
 
-**Impact**: JS can act as a client of a propagation node (`/get` works), and
-can act as a basic propagation node itself (in-memory store). It cannot peer
-with other propagation nodes: no offer protocol, no sync strategies, no peer
-rotation, no LXMPeer class, no propagation cost negotiation. A JS propagation
-node is effectively a leaf — messages only flow in from clients, never to
-other nodes.
+Ported across 4 phases (commits 7a755fa, 3326428, 796abff, cbdf68c):
 
-**Files**: `src/lxmf/LXMRouter.js`. No equivalent of `LXMPeer.py`.
+**Phase 1 — LXMPeer data model**: Full `LXMPeer` class matching Python
+`LXMF/LXMPeer.py` with state machine constants, sync strategies,
+transfer stats, batching queues, and msgpack serialization compatible
+with Python's format. Propagation entries now carry `handledPeers` /
+`unhandledPeers` Sets for per-peer tracking.
 
-**Fix shape**: large. Port `LXMPeer` class first, then `peer()`/`unpeer()`,
-then offer-protocol handlers (`/pn/peer/sync` etc.), then the distribution
-queue. This is ~40% of Python LXMRouter's line count.
+**Phase 2 — peer()/unpeer() + auto-peering**: `peer()` creates or
+updates LXMPeers with maxPeers / maxPeeringCost enforcement and
+timebase-rollback protection. `unpeer()` with timestamp guard.
+Propagation announces are auto-parsed via Transport 'announce' events
+and turned into peer relationships (matches Python's
+LXMFPropagationAnnounceHandler). Also fixed a latent
+`announcePropagation()` bug where timebase was hardcoded to 0.
+
+**Phase 3 — Receiving side**: `/offer` handler matching Python
+`offer_request()` (accepts `[peeringKey, [transientIds]]`, returns
+true/false/subset). Peer distribution queue
+(`enqueuePeerDistribution` / `flushPeerDistributionQueue`) fans stored
+messages out to all peers except the source. LXStamper gained
+`generatePeeringKey` / `validatePeeringKey` for PoW-based
+authentication. Also fixed a latent bug: `_propagationLinkEstablished`
+was calling `link.onRequest` which doesn't exist — switched to
+`registerRequestHandler`, so the `/get` client path now actually works.
+
+**Phase 4 — Outbound sync**: `LXMPeer.sync()` as an async state machine
+(IDLE → LINK_ESTABLISHING → LINK_READY → REQUEST_SENT → RESPONSE_RECEIVED
+→ RESOURCE_TRANSFERRING → IDLE). Builds offers respecting transfer and
+sync limits, sends peering key, interprets true/false/subset responses,
+packs wanted messages into a Resource, and on completion moves them to
+handled. Persistent strategy re-syncs when more work remains.
+`LXMRouter.syncPeers()` picks the best IDLE peer with pending work;
+wired into a 30-second sync loop alongside the distribution flush.
+
+**Verified with a full end-to-end integration test** (test/lxmf-peer-sync.test.js):
+two wired propagation nodes exchange announces, auto-peer, one stores
+a message, and the other receives it via a full sync round-trip
+(link → /offer → resource → proof).
+
+**Still deferred to Phase 5** (feature/ops work, not correctness):
+- Peer rotation by acceptance rate
+- Throttle tracking / `clean_throttled_peers`
+- Control-destination handlers (`/pn/get/stats`, `/pn/peer/sync`,
+  `/pn/peer/unpeer`)
+- Peer persistence to storage across restarts
+- Auto-peering from incoming sync from unknown peer
+
+**Simplifications vs Python**:
+- No `link.identify()` (JS Link lacks identify()), so identity-based
+  access control is skipped. Peering works with peeringCost=0.
+- No stamp_cost filtering on the sender (assumes stamp_cost=0).
+- Fastest-N random pool reduced to first-by-transfer-rate selection.
 
 ### 6. LXMF propagation message store is in-memory only  *(data-loss)*
 
