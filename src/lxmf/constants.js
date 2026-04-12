@@ -62,3 +62,19 @@ export const ERROR_TIMEOUT      = 0xFE;
 // Peer sync strategies
 export const STRATEGY_LAZY       = 0x01;
 export const STRATEGY_PERSISTENT = 0x02;
+
+// Peering defaults — match Python LXMF/LXMRouter.py
+export const MAX_PEERS            = 6;
+export const AUTOPEER             = true;
+export const AUTOPEER_MAXDEPTH    = 4;
+export const PEERING_COST         = 0;
+export const MAX_PEERING_COST     = 255;
+export const DEFAULT_SYNC_STRATEGY = STRATEGY_PERSISTENT;
+
+// LXMPeer timing — match Python LXMF/LXMPeer.py:37-50
+export const PEER_MAX_UNREACHABLE   = 14 * 24 * 60 * 60; // 14 days
+export const PEER_SYNC_BACKOFF_STEP = 12 * 60;            // 12 minutes
+export const PEER_PATH_REQUEST_GRACE = 7.5;               // seconds
+
+// Propagation node metadata keys
+export const PN_META_NAME = 'name';

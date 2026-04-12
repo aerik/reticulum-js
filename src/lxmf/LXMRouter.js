@@ -86,6 +86,10 @@ export class LXMRouter extends EventEmitter {
     this._messageCallback = null;
     this._deliveryCallbacks = new Map(); // destHashHex → callback
 
+    // Peering state — matches Python LXMRouter peers dict
+    this.peers = new Map();              // destHashHex → LXMPeer
+    this.peerDistributionQueue = [];     // [{ transientIdHex, fromPeerHex }]
+
     // Active links for delivery
     this._deliveryLinks = new Map(); // destHashHex → link
 
@@ -1263,6 +1267,8 @@ export class LXMRouter extends EventEmitter {
         received,
         size: lxmfData.length,
         stampValue: 0,
+        handledPeers: new Set(),
+        unhandledPeers: new Set(),
       });
 
       // Enforce storage limit
