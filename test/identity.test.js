@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { Identity } from '../src/Identity.js';
-import { equal, fromUtf8 } from '../src/utils/bytes.js';
+import { Storage } from '../src/utils/storage.js';
+import { MemoryBackend } from '../src/utils/storage-backend.js';
+import { equal, fromUtf8, toHex } from '../src/utils/bytes.js';
 import { generateX25519Keypair } from '../src/utils/crypto.js';
 
 describe('Identity', () => {
@@ -294,6 +296,85 @@ describe('Identity', () => {
       await Identity.cleanRatchets();
       expect(Identity._knownRatchets.has(staleHex)).toBe(false);
       expect(Identity._knownRatchets.size).toBe(1);
+    });
+
+    it('rememberRatchet persists to Storage when provided', async () => {
+      Identity._resetKnownRatchets();
+      const storage = new Storage(new MemoryBackend());
+      await storage.init();
+
+      const destHash = new Uint8Array(16); destHash[0] = 0xEE;
+      const pub = Identity.ratchetPublicBytes(Identity.generateRatchet());
+      await Identity.rememberRatchet(destHash, pub, { storage });
+
+      // Verify it landed in storage
+      const hexHash = toHex(destHash);
+      const loaded = await storage.loadRemoteRatchet(hexHash);
+      expect(loaded).not.toBeNull();
+      expect(equal(loaded.ratchet, pub)).toBe(true);
+      expect(typeof loaded.received).toBe('number');
+    });
+
+    it('getRatchet loads from Storage on cache miss', async () => {
+      Identity._resetKnownRatchets();
+      const storage = new Storage(new MemoryBackend());
+      await storage.init();
+
+      const destHash = new Uint8Array(16); destHash[0] = 0xDD;
+      const pub = Identity.ratchetPublicBytes(Identity.generateRatchet());
+
+      // Write directly to storage (bypassing in-memory map)
+      await storage.saveRemoteRatchet(toHex(destHash), {
+        ratchet: pub,
+        received: Date.now() / 1000,
+      });
+
+      // Should load on miss
+      const recalled = await Identity.getRatchet(destHash, { storage });
+      expect(recalled).not.toBeNull();
+      expect(equal(recalled, pub)).toBe(true);
+      // Now also cached in memory
+      expect(Identity._knownRatchets.has(toHex(destHash))).toBe(true);
+    });
+
+    it('getRatchet returns null when storage entry is expired', async () => {
+      Identity._resetKnownRatchets();
+      const storage = new Storage(new MemoryBackend());
+      await storage.init();
+
+      const destHash = new Uint8Array(16); destHash[0] = 0xCC;
+      const pub = Identity.ratchetPublicBytes(Identity.generateRatchet());
+
+      await storage.saveRemoteRatchet(toHex(destHash), {
+        ratchet: pub,
+        received: (Date.now() / 1000) - Identity.RATCHET_EXPIRY - 1,
+      });
+
+      const recalled = await Identity.getRatchet(destHash, { storage });
+      expect(recalled).toBeNull();
+    });
+
+    it('cleanRatchets removes expired entries from Storage', async () => {
+      Identity._resetKnownRatchets();
+      const storage = new Storage(new MemoryBackend());
+      await storage.init();
+
+      const freshHash = 'aa' + '00'.repeat(15);
+      const staleHash = 'bb' + '00'.repeat(15);
+      const now = Date.now() / 1000;
+
+      await storage.saveRemoteRatchet(freshHash, {
+        ratchet: Identity.ratchetPublicBytes(Identity.generateRatchet()),
+        received: now,
+      });
+      await storage.saveRemoteRatchet(staleHash, {
+        ratchet: Identity.ratchetPublicBytes(Identity.generateRatchet()),
+        received: now - Identity.RATCHET_EXPIRY - 1,
+      });
+
+      await Identity.cleanRatchets({ storage });
+      expect(await storage.loadRemoteRatchet(freshHash)).not.toBeNull();
+      expect(await storage.loadRemoteRatchet(staleHash)).toBeNull();
     });
   });
 

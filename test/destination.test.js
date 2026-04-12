@@ -218,6 +218,39 @@ describe('Destination', () => {
       expect(equal(pt, fromUtf8('secret'))).toBe(true);
     });
 
+    it('enforceRatchets returns false when ratchets are not enabled', () => {
+      const id = Identity.generate();
+      const dest = new Destination(id, DEST_IN, DEST_SINGLE, 'myapp', 'endpoint');
+      expect(dest.enforceRatchets()).toBe(false);
+    });
+
+    it('enforceRatchets returns true when ratchets are enabled', async () => {
+      const id = Identity.generate();
+      const dest = new Destination(id, DEST_IN, DEST_SINGLE, 'myapp', 'endpoint');
+      const storage = await makeStorage();
+      await dest.enableRatchets(`storage/ratchets/${dest.hexHash}`, storage);
+      expect(dest.enforceRatchets()).toBe(true);
+      expect(dest._enforceRatchets).toBe(true);
+    });
+
+    it('currentRatchetPub returns null before first rotation', async () => {
+      const id = Identity.generate();
+      const dest = new Destination(id, DEST_IN, DEST_SINGLE, 'myapp', 'endpoint');
+      const storage = await makeStorage();
+      await dest.enableRatchets(`storage/ratchets/${dest.hexHash}`, storage);
+      expect(dest.currentRatchetPub()).toBeNull();
+    });
+
+    it('currentRatchetPub returns 32-byte pub after rotation', async () => {
+      const id = Identity.generate();
+      const dest = new Destination(id, DEST_IN, DEST_SINGLE, 'myapp', 'endpoint');
+      const storage = await makeStorage();
+      await dest.enableRatchets(`storage/ratchets/${dest.hexHash}`, storage);
+      const pub = await dest.rotateRatchets();
+      expect(dest.currentRatchetPub()).toHaveLength(32);
+      expect(equal(dest.currentRatchetPub(), pub)).toBe(true);
+    });
+
     it('rejects a ratchet file whose signature does not verify', async () => {
       const id = Identity.generate();
       const other = Identity.generate();

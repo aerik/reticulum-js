@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { ResourceSender, ResourceReceiver, RESOURCE_COMPLETE } from '../src/Resource.js';
+import {
+  ResourceSender, ResourceReceiver,
+  RESOURCE_NONE, RESOURCE_ADVERTISED, RESOURCE_TRANSFERRING,
+  RESOURCE_AWAITING_PROOF, RESOURCE_COMPLETE, RESOURCE_FAILED, RESOURCE_REJECTED,
+} from '../src/Resource.js';
 import { Link, LINK_ACTIVE } from '../src/Link.js';
 import { Transport } from '../src/Transport.js';
 import { Identity } from '../src/Identity.js';
@@ -281,6 +285,286 @@ describe('Resource', () => {
       for (let i = 1; i < progressValues.length; i++) {
         expect(progressValues[i]).toBeGreaterThan(progressValues[i - 1]);
       }
+    });
+  });
+
+  describe('ResourceSender state transitions', () => {
+    it('transitions ADVERTISED → TRANSFERRING → AWAITING_PROOF → COMPLETE', async () => {
+      const { initiatorLink, responderLink } = await setupLinkedPair();
+      const data = randomBytes(1500);
+      const sender = new ResourceSender(initiatorLink, data, { encrypted: false });
+      await sender._prepareParts();
+
+      expect(sender.status).toBe(RESOURCE_NONE);
+
+      // Advertise
+      await sender.advertise();
+      expect(sender.status).toBe(RESOURCE_ADVERTISED);
+      expect(sender.retriesLeft).toBeGreaterThan(0);
+      expect(sender.advSent).toBeGreaterThan(0);
+
+      // Build receiver from adv
+      const { encode: msgpackEncode } = await import('@msgpack/msgpack');
+      const hashmap = new Uint8Array(sender.mapHashes.length * 4);
+      for (let i = 0; i < sender.mapHashes.length; i++) {
+        hashmap.set(sender.mapHashes[i], i * 4);
+      }
+      const adv = msgpackEncode({
+        t: sender.streamData.length, d: sender.originalData.length,
+        n: sender.totalParts, h: sender.hash, r: sender.randomHash,
+        o: sender.hash, i: 1, l: 1, q: null, f: 0x00,
+        m: hashmap,
+      });
+      const receiver = new ResourceReceiver(responderLink, new Uint8Array(adv));
+
+      // Build a request for the first window of parts (simulate receiver accept)
+      const reqHashes = [];
+      const windowSize = Math.min(4, sender.totalParts);
+      for (let i = 0; i < windowSize; i++) {
+        reqHashes.push(sender.mapHashes[i]);
+      }
+      const hashBytes = new Uint8Array(reqHashes.length * 4);
+      for (let i = 0; i < reqHashes.length; i++) hashBytes.set(reqHashes[i], i * 4);
+      const reqData = new Uint8Array(1 + 32 + hashBytes.length);
+      reqData[0] = 0x00; // HASHMAP_IS_NOT_EXHAUSTED
+      reqData.set(sender.hash, 1);
+      reqData.set(hashBytes, 33);
+
+      // Handle first request → should transition to TRANSFERRING
+      await sender.handleRequest(reqData);
+      expect(sender.status).toBe(sender.sentParts >= sender.totalParts
+        ? RESOURCE_AWAITING_PROOF : RESOURCE_TRANSFERRING);
+
+      // Keep requesting until all parts sent
+      while (sender.sentParts < sender.totalParts) {
+        const remaining = [];
+        for (let i = 0; i < sender.totalParts; i++) {
+          if (sender.sentParts <= i) remaining.push(sender.mapHashes[i]);
+        }
+        const batch = remaining.slice(0, 4);
+        const batchBytes = new Uint8Array(batch.length * 4);
+        for (let j = 0; j < batch.length; j++) batchBytes.set(batch[j], j * 4);
+        const req = new Uint8Array(1 + 32 + batchBytes.length);
+        req[0] = 0x00;
+        req.set(sender.hash, 1);
+        req.set(batchBytes, 33);
+        await sender.handleRequest(req);
+      }
+
+      expect(sender.status).toBe(RESOURCE_AWAITING_PROOF);
+
+      // Deliver proof
+      for (const part of sender.parts) receiver.receivePart(part);
+      const proof = receiver.generateProof();
+      sender.handleProof(proof);
+      expect(sender.status).toBe(RESOURCE_COMPLETE);
+      sender._stopWatchdog(); // cleanup
+    });
+  });
+
+  describe('ResourceSender._rejected', () => {
+    it('sets status REJECTED and fires onFailed', async () => {
+      const { initiatorLink } = await setupLinkedPair();
+      const sender = new ResourceSender(initiatorLink, randomBytes(100));
+
+      let failedWith = null;
+      sender.onFailed((err) => { failedWith = err; });
+
+      sender._rejected('test rejection');
+      expect(sender.status).toBe(RESOURCE_REJECTED);
+      expect(failedWith).toBeInstanceOf(Error);
+      expect(failedWith.message).toMatch(/test rejection/);
+    });
+
+    it('is a no-op after COMPLETE', async () => {
+      const { initiatorLink, responderLink } = await setupLinkedPair();
+      const sender = new ResourceSender(initiatorLink, randomBytes(100), { encrypted: false });
+      await sender._prepareParts();
+
+      const { encode: msgpackEncode } = await import('@msgpack/msgpack');
+      const hashmap = new Uint8Array(sender.mapHashes.length * 4);
+      for (let i = 0; i < sender.mapHashes.length; i++) hashmap.set(sender.mapHashes[i], i * 4);
+      const adv = msgpackEncode({
+        t: sender.streamData.length, d: 100,
+        n: sender.totalParts, h: sender.hash, r: sender.randomHash,
+        o: sender.hash, i: 1, l: 1, q: null, f: 0x00, m: hashmap,
+      });
+      const receiver = new ResourceReceiver(responderLink, new Uint8Array(adv));
+      for (const part of sender.parts) receiver.receivePart(part);
+      sender.handleProof(receiver.generateProof());
+      expect(sender.status).toBe(RESOURCE_COMPLETE);
+
+      let failedCalled = false;
+      sender.onFailed(() => { failedCalled = true; });
+      sender._rejected('should be ignored');
+      expect(sender.status).toBe(RESOURCE_COMPLETE);
+      expect(failedCalled).toBe(false);
+    });
+  });
+
+  describe('ResourceSender.cancel', () => {
+    it('sets status FAILED and fires onFailed', async () => {
+      const { initiatorLink } = await setupLinkedPair();
+      const sender = new ResourceSender(initiatorLink, randomBytes(100));
+      let failedWith = null;
+      sender.onFailed((err) => { failedWith = err; });
+      await sender.cancel('cancel test');
+      expect(sender.status).toBe(RESOURCE_FAILED);
+      expect(failedWith).toBeInstanceOf(Error);
+      expect(failedWith.message).toMatch(/cancel test/);
+    });
+  });
+
+  describe('ResourceReceiver.cancel', () => {
+    it('sets status FAILED and fires onFailed', async () => {
+      const { initiatorLink, responderLink } = await setupLinkedPair();
+      const sender = new ResourceSender(initiatorLink, randomBytes(500), { encrypted: false });
+      await sender._prepareParts();
+
+      const { encode: msgpackEncode } = await import('@msgpack/msgpack');
+      const hashmap = new Uint8Array(sender.mapHashes.length * 4);
+      for (let i = 0; i < sender.mapHashes.length; i++) hashmap.set(sender.mapHashes[i], i * 4);
+      const adv = msgpackEncode({
+        t: sender.streamData.length, d: 500,
+        n: sender.totalParts, h: sender.hash, r: sender.randomHash,
+        o: sender.hash, i: 1, l: 1, q: null, f: 0x00, m: hashmap,
+      });
+      const receiver = new ResourceReceiver(responderLink, new Uint8Array(adv));
+      let failedWith = null;
+      receiver.onFailed((err) => { failedWith = err; });
+
+      receiver.cancel('rx cancel test');
+      expect(receiver.status).toBe(RESOURCE_FAILED);
+      expect(failedWith).toBeInstanceOf(Error);
+      expect(failedWith.message).toMatch(/rx cancel test/);
+    });
+  });
+
+  describe('sender watchdog', () => {
+    it('ADVERTISED: retries advertisement and eventually rejects on exhaustion', async () => {
+      const { initiatorLink } = await setupLinkedPair();
+      const sender = new ResourceSender(initiatorLink, randomBytes(100));
+      await sender.advertise();
+      expect(sender.status).toBe(RESOURCE_ADVERTISED);
+
+      // Fast-forward: set advSent far in the past so each watchdog tick fires
+      sender.timeout = 0;
+      sender.retriesLeft = 2;
+
+      // Tick → should retry (not reject, still has retries)
+      sender.advSent = (Date.now() / 1000) - 100;
+      sender.lastActivity = sender.advSent;
+      sender._watchdogTick();
+      expect(sender.retriesLeft).toBe(1);
+      expect(sender.status).toBe(RESOURCE_ADVERTISED);
+
+      // Tick again → last retry
+      sender.advSent = (Date.now() / 1000) - 100;
+      sender.lastActivity = sender.advSent;
+      sender._watchdogTick();
+      expect(sender.retriesLeft).toBe(0);
+
+      // Tick when no retries left → should reject
+      sender.advSent = (Date.now() / 1000) - 100;
+      sender._watchdogTick();
+      expect(sender.status).toBe(RESOURCE_REJECTED);
+
+      sender._stopWatchdog();
+    });
+
+    it('TRANSFERRING: rejects after max_wait exceeded', async () => {
+      const { initiatorLink } = await setupLinkedPair();
+      const sender = new ResourceSender(initiatorLink, randomBytes(100));
+      sender.status = RESOURCE_TRANSFERRING;
+      sender.rtt = 0.01;
+      sender.lastActivity = (Date.now() / 1000) - 9999; // way in the past
+
+      let failedWith = null;
+      sender.onFailed((err) => { failedWith = err; });
+
+      sender._watchdogTick();
+      expect(sender.status).toBe(RESOURCE_REJECTED);
+      expect(failedWith).not.toBeNull();
+      expect(failedWith.message).toMatch(/stopped requesting/);
+    });
+
+    it('AWAITING_PROOF: extends wait on first timeout, rejects after exhaustion', async () => {
+      const { initiatorLink } = await setupLinkedPair();
+      const sender = new ResourceSender(initiatorLink, randomBytes(100));
+      sender.status = RESOURCE_AWAITING_PROOF;
+      sender.rtt = 0.01;
+      sender.retriesLeft = 1;
+      sender.lastPartSent = (Date.now() / 1000) - 9999;
+
+      // First tick → retry extends
+      sender._watchdogTick();
+      expect(sender.status).toBe(RESOURCE_AWAITING_PROOF);
+      expect(sender.retriesLeft).toBe(0);
+
+      // Second tick → no retries left → rejects
+      sender.lastPartSent = (Date.now() / 1000) - 9999;
+      sender._watchdogTick();
+      expect(sender.status).toBe(RESOURCE_REJECTED);
+    });
+  });
+
+  describe('receiver watchdog', () => {
+    async function makeReceiver() {
+      const { initiatorLink, responderLink } = await setupLinkedPair();
+      const data = randomBytes(2000);
+      const sender = new ResourceSender(initiatorLink, data, { encrypted: false });
+      await sender._prepareParts();
+
+      const { encode: msgpackEncode } = await import('@msgpack/msgpack');
+      const hashmap = new Uint8Array(sender.mapHashes.length * 4);
+      for (let i = 0; i < sender.mapHashes.length; i++) hashmap.set(sender.mapHashes[i], i * 4);
+      const adv = msgpackEncode({
+        t: sender.streamData.length, d: data.length,
+        n: sender.totalParts, h: sender.hash, r: sender.randomHash,
+        o: sender.hash, i: 1, l: 1, q: null, f: 0x00, m: hashmap,
+      });
+      const receiver = new ResourceReceiver(responderLink, new Uint8Array(adv));
+      return { sender, receiver };
+    }
+
+    it('shrinks window and retries on part timeout', async () => {
+      const { receiver } = await makeReceiver();
+      await receiver.accept();
+      const initialWindow = receiver.window;
+
+      // Simulate: parts were requested but never arrived. Fast-forward time.
+      receiver.outstandingParts = 3;
+      receiver.lastActivity = (Date.now() / 1000) - 9999;
+      receiver.retriesLeft = 5;
+      const initialRetries = receiver.retriesLeft;
+
+      receiver._watchdogTick();
+      expect(receiver.retriesLeft).toBe(initialRetries - 1);
+      // Window should have shrunk
+      expect(receiver.window).toBeLessThanOrEqual(initialWindow);
+      // Should still be transferring (retries remain)
+      expect(receiver.status).toBe(RESOURCE_TRANSFERRING);
+
+      receiver._stopWatchdog();
+    });
+
+    it('cancels after exhausting retries', async () => {
+      const { receiver } = await makeReceiver();
+      await receiver.accept();
+
+      receiver.outstandingParts = 3;
+      receiver.lastActivity = (Date.now() / 1000) - 9999;
+      receiver.retriesLeft = 0;
+
+      let failedWith = null;
+      receiver.onFailed((err) => { failedWith = err; });
+
+      receiver._watchdogTick();
+      expect(receiver.status).toBe(RESOURCE_FAILED);
+      expect(failedWith).not.toBeNull();
+      expect(failedWith.message).toMatch(/Timeout/);
+
+      receiver._stopWatchdog();
     });
   });
 });
