@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { Identity } from '../src/Identity.js';
 import { equal, fromUtf8 } from '../src/utils/bytes.js';
+import { generateX25519Keypair } from '../src/utils/crypto.js';
 
 describe('Identity', () => {
   describe('generate', () => {
@@ -133,6 +134,86 @@ describe('Identity', () => {
       const ct = await id.encrypt(new Uint8Array(0));
       const pt = await id.decrypt(ct);
       expect(pt.length).toBe(0);
+    });
+  });
+
+  describe('multi-ratchet decrypt', () => {
+    // These tests exercise the Python-style decrypt() options added to match
+    // RNS/Identity.py:713 — specifically the multi-ratchet walk and the
+    // enforce_ratchets flag.
+
+    it('decrypts a message encrypted to a ratchet public key', async () => {
+      const recipient = Identity.generate();
+      const ratchet = generateX25519Keypair();
+      const ct = await recipient.encrypt(fromUtf8('msg'), ratchet.publicKey);
+      const pt = await recipient.decrypt(ct, { ratchets: [ratchet.privateKey] });
+      expect(equal(pt, fromUtf8('msg'))).toBe(true);
+    });
+
+    it('walks the ratchets list until one works', async () => {
+      const recipient = Identity.generate();
+      const r1 = generateX25519Keypair();
+      const r2 = generateX25519Keypair();
+      const r3 = generateX25519Keypair();
+      const ct = await recipient.encrypt(fromUtf8('msg'), r2.publicKey);
+      // Provide in an order where r2 isn't first — decrypt must iterate.
+      const pt = await recipient.decrypt(ct, {
+        ratchets: [r1.privateKey, r3.privateKey, r2.privateKey],
+      });
+      expect(equal(pt, fromUtf8('msg'))).toBe(true);
+    });
+
+    it('falls back to base key when no ratchet matches', async () => {
+      const recipient = Identity.generate();
+      const wrongRatchet = generateX25519Keypair();
+      // Encrypt with the identity's BASE key (no ratchet)
+      const ct = await recipient.encrypt(fromUtf8('msg'));
+      // Pass a wrong ratchet — should fall through to base key
+      const pt = await recipient.decrypt(ct, { ratchets: [wrongRatchet.privateKey] });
+      expect(equal(pt, fromUtf8('msg'))).toBe(true);
+    });
+
+    it('enforceRatchets fails instead of falling back to base', async () => {
+      const recipient = Identity.generate();
+      const wrongRatchet = generateX25519Keypair();
+      const ct = await recipient.encrypt(fromUtf8('msg'));
+      await expect(
+        recipient.decrypt(ct, {
+          ratchets: [wrongRatchet.privateKey],
+          enforceRatchets: true,
+        })
+      ).rejects.toThrow(/Ratchet-enforced/);
+    });
+
+    it('populates ratchetIdReceiver on ratchet success', async () => {
+      const recipient = Identity.generate();
+      const ratchet = generateX25519Keypair();
+      const ct = await recipient.encrypt(fromUtf8('msg'), ratchet.publicKey);
+      const receiver = { latestRatchetId: undefined };
+      await recipient.decrypt(ct, {
+        ratchets: [ratchet.privateKey],
+        ratchetIdReceiver: receiver,
+      });
+      expect(receiver.latestRatchetId).toBeInstanceOf(Uint8Array);
+      expect(receiver.latestRatchetId).toHaveLength(10);
+      // Should equal Identity.getRatchetId(ratchet.publicKey)
+      expect(equal(receiver.latestRatchetId, Identity.getRatchetId(ratchet.publicKey))).toBe(true);
+    });
+
+    it('sets ratchetIdReceiver.latestRatchetId = null when base key is used', async () => {
+      const recipient = Identity.generate();
+      const ct = await recipient.encrypt(fromUtf8('msg'));
+      const receiver = { latestRatchetId: undefined };
+      await recipient.decrypt(ct, { ratchetIdReceiver: receiver });
+      expect(receiver.latestRatchetId).toBe(null);
+    });
+
+    it('legacy instance _ratchetPriv still works for callers without options', async () => {
+      const recipient = Identity.generate();
+      const ratchetPub = recipient.rotateRatchet();
+      const ct = await recipient.encrypt(fromUtf8('msg'), ratchetPub);
+      const pt = await recipient.decrypt(ct);
+      expect(equal(pt, fromUtf8('msg'))).toBe(true);
     });
   });
 

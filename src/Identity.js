@@ -32,6 +32,7 @@ import { concat, toHex, fromHex, randomBytes, equal } from './utils/bytes.js';
 import {
   IDENTITY_HASH_LENGTH,
   IDENTITY_DERIVED_KEY_LENGTH,
+  IDENTITY_NAME_HASH_LENGTH,
 } from './constants.js';
 
 export class Identity {
@@ -266,33 +267,77 @@ export class Identity {
   }
 
   /**
+   * Compute the 10-byte ratchet id from a ratchet public key.
+   * Matches Python `Identity._get_ratchet_id` in RNS/Identity.py:283.
+   * @param {Uint8Array} ratchetPubBytes - 32-byte X25519 public key
+   * @returns {Uint8Array} 10-byte ratchet id
+   */
+  static getRatchetId(ratchetPubBytes) {
+    return sha256Hash(ratchetPubBytes).slice(0, IDENTITY_NAME_HASH_LENGTH);
+  }
+
+  /**
    * Decrypt ciphertext intended for this identity.
    *
-   * Matches Python RNS Identity.decrypt():
+   * Matches Python RNS Identity.decrypt() in RNS/Identity.py:713:
    *   1. Extract ephemeral pub (32 bytes) and token (rest)
-   *   2. ECDH with our X25519 private key
-   *   3. HKDF(ikm=shared_secret, salt=our_identity_hash, info=empty) → 64 bytes
-   *   4. Verify HMAC, then AES-256-CBC decrypt
+   *   2. If `ratchets` is provided, walk the list and try each private-key
+   *      ratchet in turn. On the first success, capture the ratchet id on
+   *      `ratchetIdReceiver.latestRatchetId` and return.
+   *   3. If `enforceRatchets` is true and no ratchet worked, fail hard
+   *      (don't fall back to the base key).
+   *   4. Otherwise fall back to ECDH with our base X25519 private key.
+   *   5. HKDF(ikm=shared_secret, salt=our_identity_hash, info=empty) → 64 bytes
+   *   6. Verify HMAC, then AES-256-CBC decrypt.
    *
    * @param {Uint8Array} data - ephemeral_pub(32) + IV(16) + ciphertext + HMAC(32)
+   * @param {object} [options]
+   * @param {Uint8Array[]} [options.ratchets] - List of 32-byte X25519 ratchet
+   *     private keys to try before falling back to the base key
+   * @param {boolean} [options.enforceRatchets=false] - When true, fail instead
+   *     of falling back to the base key if no ratchet succeeds
+   * @param {{latestRatchetId: (Uint8Array|null)}} [options.ratchetIdReceiver]
+   *     Object whose `latestRatchetId` is set to the id of the successful
+   *     ratchet, or `null` if the base key was used
    * @returns {Promise<Uint8Array>} plaintext
    */
-  async decrypt(data) {
+  async decrypt(data, options = {}) {
     if (!this.encryptionPrivateKey) {
       throw new Error('Cannot decrypt without private key');
     }
 
-    // Try ratchet key first, if available
-    if (this._ratchetPriv) {
+    const ratchets = options.ratchets || [];
+    const enforceRatchets = options.enforceRatchets === true;
+    const idReceiver = options.ratchetIdReceiver || null;
+
+    // Build the list of ratchets to try. Explicit `options.ratchets` take
+    // priority; fall back to the legacy instance ratchet (`_ratchetPriv`) so
+    // existing callers that set a single ratchet keep working.
+    const ratchetsToTry = ratchets.length > 0 ? ratchets : (this._ratchetPriv ? [this._ratchetPriv] : []);
+
+    let lastError = null;
+    for (const ratchetPriv of ratchetsToTry) {
       try {
-        return await this._decryptWith(data, this._ratchetPriv);
-      } catch {
-        // Ratchet didn't work — fall through to base key
+        const plaintext = await this._decryptWith(data, ratchetPriv);
+        if (idReceiver) {
+          const ratchetPub = _x25519.getPublicKey(ratchetPriv);
+          idReceiver.latestRatchetId = Identity.getRatchetId(ratchetPub);
+        }
+        return plaintext;
+      } catch (err) {
+        lastError = err;
       }
     }
 
+    if (enforceRatchets) {
+      if (idReceiver) idReceiver.latestRatchetId = null;
+      throw new Error(
+        `Ratchet-enforced decryption failed: ${lastError ? lastError.message : 'no ratchets supplied'}`
+      );
+    }
 
-    // Try base identity key
+    // Fall back to base identity key
+    if (idReceiver) idReceiver.latestRatchetId = null;
     return this._decryptWith(data, this.encryptionPrivateKey);
   }
 

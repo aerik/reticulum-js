@@ -26,14 +26,14 @@ and ratchet persistence.
 | sign(data) | MATCHED | Ed25519 → 64 bytes |
 | verify(sig, data) | MATCHED | Ed25519 verify |
 | encrypt(plaintext, ratchet?) | PARTIAL | JS async, Python sync. Format: `ephemeral_pub(32) + IV(16) + ciphertext + HMAC(32)`. Same. |
-| decrypt(ciphertext, ratchets?) | **PARTIAL — CRITICAL** | Python walks a list of ratchets + enforce flag; JS tries only `_ratchetPriv` then base key. |
+| decrypt(ciphertext, options?) | MATCHED | `decrypt(data, { ratchets, enforceRatchets, ratchetIdReceiver })` walks the list, falls back to base unless `enforceRatchets` is set, and populates the ratchet id receiver. Legacy single-ratchet calls without options still work via `_ratchetPriv`. |
 | __decrypt() / _decryptWith() | MATCHED | HKDF(ikm=shared, salt=identity_hash, info=empty), split signing/enc, verify HMAC, decrypt |
 | HKDF parameters | MATCHED | RFC 5869, 64-byte output, split [0:32]/[32:64] |
 | rotateRatchet() | MATCHED (instance only) | Generates new X25519 keypair |
 | ratchetPublicKey getter | MATCHED | Returns current or null |
 | setRemoteRatchet(pub) | MATCHED | Stores known remote ratchet |
 | known_ratchets static store | MISSING | No persistent ratchet store |
-| ratchet_id / name hash for announces | MISSING | Python: `full_hash(ratchet_pub)[:NAME_HASH_LENGTH//8]` |
+| ratchet_id / name hash for announces | MATCHED | `Identity.getRatchetId(pub)` static — `sha256(pub)[:10]`, matches Python |
 | remember(packet_hash, dest_hash, pub_key, app_data) | MISSING | Announce table is in Transport instead |
 | recall(target_hash, from_identity_hash?) | MISSING | Lookup via `Transport.announceTable` |
 | recall_app_data(dest_hash) | MISSING | Not implemented |
@@ -46,8 +46,7 @@ and ratchet persistence.
 
 ## Critical gaps
 
-1. **Multi-ratchet decrypt missing** — see parity doc gap #3. Single ratchet
-   is tried; if peer rotated, decrypt fails.
+1. ~~**Multi-ratchet decrypt missing**~~ — **FIXED**. `decrypt(data, { ratchets, enforceRatchets, ratchetIdReceiver })` walks the supplied list.
 
 2. **No persistent ratchet storage** — see parity doc gap #2. Instance state
    only; restart loses the rotation chain.

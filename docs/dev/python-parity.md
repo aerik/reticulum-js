@@ -46,7 +46,7 @@ load or against adversarial peers.
 | File pair | Parity | Verdict |
 |-----------|-------:|---------|
 | `Packet.js` ↔ `RNS/Packet.py` | ~85% | Wire format matches; `pack()` doesn't encrypt (callers do it); no `PacketReceipt`/`ProofDestination`; LRPROOF special-case not in Packet itself (Link handles it). |
-| `Identity.js` ↔ `RNS/Identity.py` | ~75% | Crypto primitives match exactly (HKDF/AES/Ed25519/X25519). Announce validation lives in `Announce.js` not Identity. No `recall()`/`remember()` (uses `Transport.announceTable`). **Multi-ratchet decrypt missing** — JS tries only one ratchet. |
+| `Identity.js` ↔ `RNS/Identity.py` | ~80% | Crypto primitives match exactly (HKDF/AES/Ed25519/X25519). Multi-ratchet decrypt now matches Python (see gap #3). Announce validation lives in `Announce.js` not Identity. No `recall()`/`remember()` (uses `Transport.announceTable`). |
 | `Destination.js` ↔ `RNS/Destination.py` | ~40% | Skeleton: hash, callbacks, name expansion. `announce()` is in `src/Announce.js` (architectural split). **No ratchet management**, **no request handlers**, **no `encrypt()`/`decrypt()` dispatch**, **no `incoming_link_request()`**, **no GROUP destination support**. |
 | `Link.js` ↔ `RNS/Link.py` | ~85% | Handshake, encryption, watchdog, STALE/TIMEOUT, RCL/ICL/PRF dispatch all correct. Missing: `RequestReceipt` API, resource strategy, MDU calc, mode negotiation, Channel, physical stats, `identify()`. |
 | `Resource.js` ↔ `RNS/Resource.py` | ~85% | Advertisement/parts/HMU/proof, watchdog/retry loop, and AWAITING_PROOF state all match. Still missing: adaptive window tuning (EIFR-based), multi-segment, auto-compression, metadata, input_file streaming. Status enum now matches Python numbering except REJECTED. |
@@ -99,17 +99,14 @@ or `_persist_ratchets()`. No `known_ratchets` static store anywhere.
 `rotate_ratchets()` into the announce path so each announce carries a fresh
 ratchet when due.
 
-### 3. Identity.decrypt() tries only one ratchet  *(interop reliability)*
+### 3. ~~Identity.decrypt() tries only one ratchet~~ — FIXED
 
-**Impact**: Python's `decrypt(ciphertext, ratchets=[list], enforce_ratchets,
-ratchet_id_receiver)` walks a list of known ratchets until one works. JS only
-tries `_ratchetPriv` then the base key. If a peer rotated ratchets rapidly and
-sent a few messages under different ratchets, JS decrypts zero or one.
-
-**Files**: `src/Identity.js:decrypt()`.
-
-**Fix shape**: accept a ratchets list, iterate trying each, optionally enforce
-(fail if base-key decryption is the only one that works).
+`decrypt(data, { ratchets, enforceRatchets, ratchetIdReceiver })` now walks
+the supplied list, matches Python `RNS/Identity.py:713`, and populates the
+ratchet id receiver with the result of `Identity.getRatchetId(pub)` on
+success. Legacy single-ratchet callers (no options arg) still work via the
+instance `_ratchetPriv`. Verified with 7 new unit tests covering the walk,
+fall-back, enforce, and ratchet-id-receiver paths.
 
 ### 4. LXMF: sender doesn't check receiver `delivery_per_transfer_limit`  *(known: Finding #2)*
 
