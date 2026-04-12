@@ -199,13 +199,15 @@ Added `ACCEPT_NONE` (default), `ACCEPT_APP`, `ACCEPT_ALL` constants and
 
 LXMF uses `ACCEPT_APP` for delivery links (gap #4).
 
-### 10. Link: no RequestReceipt API  *(feature)*
+### 10. ~~Link: no RequestReceipt API~~ — FIXED
 
-**Impact**: High-level `link.request(path, data, callback, timeout)` →
-`RequestReceipt` doesn't exist. Callers have to emit RESOURCE-tagged data
-manually. Python's receipt tracks SENT / DELIVERED / READY / FAILED states.
-
-**Files**: `src/Link.js` — no `request()` method, no `RequestReceipt` class.
+`RequestReceipt` class added with SENT/DELIVERED/RECEIVING/READY/FAILED
+states, `onResponse`/`onFailed`/`onProgress` callbacks, and
+`getResponse()`/`getStatus()` accessors matching Python
+`RNS/Link.py:1349-1542`. `link.request()` now returns a Promise with a
+`.receipt` property — `await link.request(...)` still resolves to response
+data for backward compatibility, while `link.request(...).receipt` gives
+the full state machine. Receipts are failed automatically on link teardown.
 
 ---
 

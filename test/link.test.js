@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import {
   Link, LINK_PENDING, LINK_HANDSHAKE, LINK_ACTIVE, LINK_CLOSED,
   ACCEPT_NONE, ACCEPT_APP, ACCEPT_ALL,
+  RequestReceipt, REQUEST_SENT, REQUEST_READY, REQUEST_FAILED,
 } from '../src/Link.js';
 import { Transport } from '../src/Transport.js';
 import { Identity } from '../src/Identity.js';
@@ -374,6 +375,101 @@ describe('Link', () => {
       expect(bytes).toBe(500);
       const received = await receivePromise;
       expect(equal(received, data)).toBe(true);
+    });
+  });
+
+  describe('RequestReceipt', () => {
+    it('request() returns a Promise with .receipt accessor', async () => {
+      const { initiatorLink, responderLink } = await setupLinkedPairWired();
+      responderLink.registerRequestHandler('/test', async (data) => fromUtf8('pong'));
+
+      const promise = initiatorLink.request('/test', fromUtf8('ping'));
+      expect(promise.receipt).toBeInstanceOf(RequestReceipt);
+      expect(promise.receipt.getStatus()).toBe(REQUEST_SENT);
+      await promise; // let it complete
+    });
+
+    it('await resolves to response data (backward compat)', async () => {
+      const { initiatorLink, responderLink } = await setupLinkedPairWired();
+      responderLink.registerRequestHandler('/echo', async (data) => data);
+
+      const response = await initiatorLink.request('/echo', fromUtf8('hello'));
+      expect(equal(response, fromUtf8('hello'))).toBe(true);
+    });
+
+    it('receipt reaches READY status after response', async () => {
+      const { initiatorLink, responderLink } = await setupLinkedPairWired();
+      responderLink.registerRequestHandler('/echo', async (data) => data);
+
+      const promise = initiatorLink.request('/echo', fromUtf8('data'));
+      const receipt = promise.receipt;
+
+      await promise; // wait for response
+
+      expect(receipt.getStatus()).toBe(REQUEST_READY);
+      expect(receipt.getResponse()).not.toBeNull();
+      expect(equal(receipt.getResponse(), fromUtf8('data'))).toBe(true);
+    });
+
+    it('fires onResponse callback when response arrives', async () => {
+      const { initiatorLink, responderLink } = await setupLinkedPairWired();
+      responderLink.registerRequestHandler('/test', async () => fromUtf8('ok'));
+
+      let callbackReceipt = null;
+      const promise = initiatorLink.request('/test', null, {
+        onResponse: (r) => { callbackReceipt = r; },
+      });
+      const receipt = promise.receipt;
+
+      await promise;
+
+      expect(callbackReceipt).toBe(receipt);
+      expect(callbackReceipt.getStatus()).toBe(REQUEST_READY);
+    });
+
+    it('times out and resolves to null with FAILED status', async () => {
+      const { initiatorLink } = await setupLinkedPairWired();
+
+      let failedReceipt = null;
+      const promise = initiatorLink.request('/missing', null, {
+        timeout: 200,
+        onFailed: (r) => { failedReceipt = r; },
+      });
+      const receipt = promise.receipt;
+
+      const result = await promise;
+      expect(result).toBeNull();
+      expect(receipt.getStatus()).toBe(REQUEST_FAILED);
+      expect(failedReceipt).toBe(receipt);
+    });
+
+    it('legacy numeric timeout argument still works', async () => {
+      const { initiatorLink } = await setupLinkedPairWired();
+      const response = await initiatorLink.request('/missing', null, 200);
+      expect(response).toBeNull();
+    });
+
+    it('receipt is failed when link closes before response', async () => {
+      const { initiatorLink, responderLink } = await setupLinkedPairWired();
+      responderLink.registerRequestHandler('/slow', async () => {
+        await new Promise(r => setTimeout(r, 60000));
+        return fromUtf8('too late');
+      });
+
+      const promise = initiatorLink.request('/slow', null, {
+        timeout: 5000,
+        onFailed: () => {},
+      });
+      const receipt = promise.receipt;
+
+      // Wait for the async send to complete
+      await new Promise(r => setImmediate(r));
+      await new Promise(r => setImmediate(r));
+
+      await initiatorLink.close();
+      await new Promise(r => setImmediate(r));
+
+      expect(receipt.getStatus()).toBe(REQUEST_FAILED);
     });
   });
 });

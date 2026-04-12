@@ -68,6 +68,13 @@ export const ACCEPT_NONE = 0x00;
 export const ACCEPT_APP  = 0x01;
 export const ACCEPT_ALL  = 0x02;
 
+// RequestReceipt states — match Python RNS/Link.py:1349-1356.
+export const REQUEST_FAILED    = 0x00;
+export const REQUEST_SENT      = 0x01;
+export const REQUEST_DELIVERED = 0x02;
+export const REQUEST_RECEIVING = 0x03;
+export const REQUEST_READY     = 0x04;
+
 // Sizes
 const ECPUBSIZE = 64; // 32 X25519 + 32 Ed25519
 
@@ -454,56 +461,77 @@ export class Link extends EventEmitter {
    * @param {number} [timeout=10000] - Response timeout in ms
    * @returns {Promise<Uint8Array|null>} Response data, or null on timeout
    */
-  async request(path, data = null, timeout = 10000) {
+  /**
+   * Send a request to the remote peer via the link, matching Python's
+   * `Link.request()` in RNS/Link.py:478.
+   *
+   * Returns a Promise that resolves to the response data (Uint8Array) or
+   * `null` on timeout/failure — so `await link.request(...)` works exactly
+   * as before. The returned Promise also has a `.receipt` property for
+   * callers who want the full `RequestReceipt` state machine + callbacks.
+   *
+   * @param {string} path - Request path (hashed to 16 bytes internally)
+   * @param {Uint8Array|null} [data] - Request payload
+   * @param {number|object} [optionsOrTimeout] - Timeout in ms (legacy) or options:
+   *   @param {number} [optionsOrTimeout.timeout=10000]
+   *   @param {function(RequestReceipt):void} [optionsOrTimeout.onResponse]
+   *   @param {function(RequestReceipt):void} [optionsOrTimeout.onFailed]
+   *   @param {function(RequestReceipt):void} [optionsOrTimeout.onProgress]
+   * @returns {Promise<Uint8Array|null> & {receipt: RequestReceipt}}
+   */
+  request(path, data = null, optionsOrTimeout = {}) {
     if (this.status !== LINK_ACTIVE) {
-      throw new Error('Link is not active');
+      return Promise.reject(new Error('Link is not active'));
     }
 
-    // Path hash: SHA256(path_utf8)[:16] — matching Python's Identity.truncated_hash()
-    const pathHash = truncatedHash(new TextEncoder().encode(path), IDENTITY_HASH_LENGTH);
-    const timestamp = Date.now() / 1000;
+    const opts = typeof optionsOrTimeout === 'number'
+      ? { timeout: optionsOrTimeout }
+      : optionsOrTimeout;
+    const timeout = opts.timeout || 10000;
 
-    // Pack as msgpack array: [timestamp, path_hash, data]
-    const packed = msgpackEncode([timestamp, pathHash, data]);
-    const packedBytes = new Uint8Array(packed);
+    const receipt = new RequestReceipt(this, null, Date.now() / 1000, timeout, opts);
 
-    // Build packet manually so we can capture the packet hash for request_id.
-    // Python computes request_id = SHA256(SHA256(hashable_part))[:16]
-    // which is truncatedHash(packet.packetHash).
-    const encrypted = await this.encrypt(packedBytes);
-    const pkt = new Packet();
-    pkt.headerType = HEADER_1;
-    pkt.packetType = PACKET_DATA;
-    pkt.destType = DEST_LINK;
-    pkt.transportType = TRANSPORT_BROADCAST;
-    pkt.destinationHash = this.linkId;
-    pkt.context = CONTEXT_REQUEST;
-    pkt.data = encrypted;
-    pkt.pack(); // computes packetHash = SHA256(hashable_part)
+    const dataPromise = (async () => {
+      // Path hash: SHA256(path_utf8)[:16]
+      const pathHash = truncatedHash(new TextEncoder().encode(path), IDENTITY_HASH_LENGTH);
+      const timestamp = Date.now() / 1000;
 
-    // request_id = packetHash[:16] — matches Python's getTruncatedHash()
-    // Python: getTruncatedHash() = SHA256(hashable_part)[:16] = get_hash()[:16]
-    // Our packetHash is already SHA256(hashable_part), so just slice it.
-    const requestId = pkt.packetHash.slice(0, IDENTITY_HASH_LENGTH);
+      const packed = msgpackEncode([timestamp, pathHash, data]);
+      const packedBytes = new Uint8Array(packed);
 
-    this._transport.transmit(pkt);
-    this.lastOutbound = Date.now();
+      const encrypted = await this.encrypt(packedBytes);
+      const pkt = new Packet();
+      pkt.headerType = HEADER_1;
+      pkt.packetType = PACKET_DATA;
+      pkt.destType = DEST_LINK;
+      pkt.transportType = TRANSPORT_BROADCAST;
+      pkt.destinationHash = this.linkId;
+      pkt.context = CONTEXT_REQUEST;
+      pkt.data = encrypted;
+      pkt.pack();
 
-    // Wait for response
-    return new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        this._pendingRequests.delete(toHex(requestId));
-        resolve(null);
-      }, timeout);
+      const requestId = pkt.packetHash.slice(0, IDENTITY_HASH_LENGTH);
+      const requestIdHex = toHex(requestId);
 
-      this._pendingRequests.set(toHex(requestId), {
+      receipt.requestId = requestId;
+      receipt.hash = requestId;
+
+      this._transport.transmit(pkt);
+      this.lastOutbound = Date.now();
+
+      this._pendingRequests.set(requestIdHex, {
+        receipt,
         resolve: (responseData) => {
-          clearTimeout(timer);
-          this._pendingRequests.delete(toHex(requestId));
-          resolve(responseData);
+          this._pendingRequests.delete(requestIdHex);
+          receipt._responseReceived(responseData);
         },
       });
-    });
+
+      return receipt.promise;
+    })();
+
+    dataPromise.receipt = receipt;
+    return dataPromise;
   }
 
   /**
@@ -568,7 +596,7 @@ export class Link extends EventEmitter {
       const requestIdHex = toHex(new Uint8Array(requestId));
 
       const pending = this._pendingRequests.get(requestIdHex);
-      if (pending) {
+      if (pending && pending.resolve) {
         pending.resolve(responseData ? new Uint8Array(responseData) : null);
       }
     } catch (err) {
@@ -1300,6 +1328,14 @@ export class Link extends EventEmitter {
       this._pendingProofs.clear();
     }
 
+    // Fail any pending request receipts
+    if (this._pendingRequests && this._pendingRequests.size > 0) {
+      for (const pending of this._pendingRequests.values()) {
+        if (pending.receipt) pending.receipt._failed('Link closed');
+      }
+      this._pendingRequests.clear();
+    }
+
     // Reject any in-flight outgoing resources
     if (this._outgoingResources && this._outgoingResources.size > 0) {
       for (const entry of this._outgoingResources.values()) {
@@ -1324,4 +1360,103 @@ export class Link extends EventEmitter {
 
     this.emit('closed', reason);
   }
+}
+
+/**
+ * Tracks the lifecycle of a request sent via `Link.request()`.
+ *
+ * Matches Python's `RequestReceipt` in RNS/Link.py:1349-1542. States:
+ *   SENT      → request transmitted, awaiting delivery or response
+ *   DELIVERED → (reserved for future packet-receipt integration)
+ *   RECEIVING → (reserved for large-response progress tracking)
+ *   READY     → response received, available via `getResponse()`
+ *   FAILED    → timed out or link closed
+ *
+ * The receipt is a thenable (has `.then()` / `.catch()`), so callers can
+ * `await link.request(path, data)` for backward compatibility. The promise
+ * resolves with the response data or `null` on timeout/failure.
+ */
+export class RequestReceipt {
+  /**
+   * @param {Link} link
+   * @param {Uint8Array} requestId - 16-byte request identifier
+   * @param {number} sentAt - Unix timestamp (seconds)
+   * @param {number} timeoutMs - Max wait time in milliseconds
+   * @param {object} callbacks
+   * @param {function} [callbacks.onResponse]
+   * @param {function} [callbacks.onFailed]
+   * @param {function} [callbacks.onProgress]
+   */
+  constructor(link, requestId, sentAt, timeoutMs, callbacks = {}) {
+    this.link = link;
+    this.requestId = requestId;
+    this.hash = requestId;
+    this.status = REQUEST_SENT;
+    this.sentAt = sentAt;
+    this.response = null;
+    this.responseSize = 0;
+    this.progress = 0;
+    this.concludedAt = null;
+
+    this._responseCallback = callbacks.onResponse || null;
+    this._failedCallback = callbacks.onFailed || null;
+    this._progressCallback = callbacks.onProgress || null;
+
+    this._resolve = null;
+    this._reject = null;
+    this.promise = new Promise((resolve, reject) => {
+      this._resolve = resolve;
+      this._reject = reject;
+    });
+
+    this._timer = setTimeout(() => this._timedOut(), timeoutMs);
+    if (this._timer && typeof this._timer.unref === 'function') {
+      this._timer.unref();
+    }
+  }
+
+  then(onFulfilled, onRejected) { return this.promise.then(onFulfilled, onRejected); }
+  catch(onRejected) { return this.promise.catch(onRejected); }
+
+  /**
+   * Called when the response data arrives from the remote peer.
+   * Matches Python `RequestReceipt.response_received` in RNS/Link.py:1471.
+   * @param {Uint8Array|null} data
+   */
+  _responseReceived(data) {
+    if (this.status >= REQUEST_READY) return;
+    clearTimeout(this._timer);
+    this.response = data;
+    this.responseSize = data ? data.length : 0;
+    this.status = REQUEST_READY;
+    this.progress = 1.0;
+    this.concludedAt = Date.now() / 1000;
+    if (this._progressCallback) try { this._progressCallback(this); } catch {}
+    if (this._responseCallback) try { this._responseCallback(this); } catch {}
+    if (this._resolve) this._resolve(data);
+  }
+
+  _timedOut() {
+    if (this.status >= REQUEST_READY) return;
+    this.status = REQUEST_FAILED;
+    this.concludedAt = Date.now() / 1000;
+    if (this._failedCallback) try { this._failedCallback(this); } catch {}
+    if (this._resolve) this._resolve(null);
+  }
+
+  _failed(reason) {
+    if (this.status >= REQUEST_READY) return;
+    clearTimeout(this._timer);
+    this.status = REQUEST_FAILED;
+    this.concludedAt = Date.now() / 1000;
+    if (this._failedCallback) try { this._failedCallback(this); } catch {}
+    if (this._resolve) this._resolve(null);
+  }
+
+  getResponse() { return this.status === REQUEST_READY ? this.response : null; }
+  getStatus() { return this.status; }
+
+  onResponse(fn) { this._responseCallback = fn; return this; }
+  onFailed(fn) { this._failedCallback = fn; return this; }
+  onProgress(fn) { this._progressCallback = fn; return this; }
 }
