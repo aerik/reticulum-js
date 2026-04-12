@@ -12,12 +12,20 @@
  */
 
 import { Identity } from '../Identity.js';
+import { Destination } from '../Destination.js';
+import { Link } from '../Link.js';
 import { encode as msgpackEncode, decode as msgpackDecode } from '@msgpack/msgpack';
-import { toHex, fromHex, equal } from '../utils/bytes.js';
-import { log, LOG_DEBUG, LOG_WARNING } from '../utils/log.js';
+import { toHex, fromHex, equal, concat } from '../utils/bytes.js';
+import { log, LOG_DEBUG, LOG_INFO, LOG_WARNING, LOG_VERBOSE } from '../utils/log.js';
+import { generatePeeringKey } from './LXStamper.js';
 import {
-  PEER_IDLE, DEFAULT_SYNC_STRATEGY, STRATEGY_PERSISTENT,
-  PEER_MAX_UNREACHABLE, PEER_SYNC_BACKOFF_STEP, PN_META_NAME,
+  PEER_IDLE, PEER_LINK_ESTABLISHING, PEER_LINK_READY, PEER_REQUEST_SENT,
+  PEER_RESPONSE_RECEIVED, PEER_RESOURCE_TRANSFERRING,
+  DEFAULT_SYNC_STRATEGY, STRATEGY_PERSISTENT,
+  PEER_MAX_UNREACHABLE, PEER_SYNC_BACKOFF_STEP, PEER_PATH_REQUEST_GRACE,
+  PN_META_NAME, OFFER_REQUEST_PATH,
+  ERROR_NO_IDENTITY, ERROR_NO_ACCESS, ERROR_INVALID_KEY, ERROR_INVALID_DATA,
+  ERROR_THROTTLED, APP_NAME,
 } from './constants.js';
 
 const TAG = 'LXMPeer';
@@ -330,5 +338,292 @@ export class LXMPeer {
       log(LOG_WARNING, TAG, `Failed to deserialize peer: ${err.message}`);
       return null;
     }
+  }
+
+  // --- Outbound sync state machine ---
+  //
+  // Matches Python LXMPeer.sync() + callbacks in LXMF/LXMPeer.py:267-542.
+  // The Python version is synchronous with blocking sleeps and threading;
+  // the JS version uses async/await and Link/RequestReceipt events while
+  // preserving the same state transitions.
+
+  /**
+   * Whether it's OK to attempt a sync right now. Matches Python
+   * `sync_checks` computation at the top of `sync()`.
+   */
+  get shouldSync() {
+    const now = Date.now() / 1000;
+    const syncTimeReached = now > this.nextSyncAttempt;
+    const stampCostsKnown = this.propagationStampCost != null
+      && this.propagationStampCostFlexibility != null
+      && this.peeringCost != null;
+    return syncTimeReached && stampCostsKnown;
+  }
+
+  /**
+   * Resolve (or reuse) the outbound destination for this peer. Needs the
+   * remote identity which is cached in Transport.announceTable after the
+   * peer's announce was validated.
+   */
+  _resolveDestination() {
+    if (this.destination) return this.destination;
+    if (!this.identity) {
+      const entry = this.router.transport.announceTable.get(this.destinationHashHex);
+      if (entry && entry.identity) this.identity = entry.identity;
+    }
+    if (this.identity) {
+      this.destination = new Destination(this.identity, 0x12 /* DEST_OUT */, 0x00 /* DEST_SINGLE */, APP_NAME, 'propagation');
+    }
+    return this.destination;
+  }
+
+  /**
+   * Initiate a sync with this peer. Returns true if sync was attempted,
+   * false if preconditions weren't met.
+   *
+   * Maps to Python LXMPeer.sync() at LXMF/LXMPeer.py:267. Phases:
+   *   1. Check gates (timing, costs).
+   *   2. Open link.
+   *   3. Build offer from unhandled messages (respecting transfer limit).
+   *   4. Send /offer request, await response.
+   *   5. For the subset the peer wants, send a resource with the raw data.
+   *   6. On resource complete, move messages to handled and optionally
+   *      re-sync (persistent strategy).
+   */
+  async sync() {
+    if (this.state !== PEER_IDLE) {
+      log(LOG_DEBUG, TAG, `sync() called while peer state=${this.state}, skipping`);
+      return false;
+    }
+
+    this.lastSyncAttempt = Date.now() / 1000;
+
+    if (!this.shouldSync) {
+      log(LOG_DEBUG, TAG, `sync postponed — gate not reached for ${this.destinationHashHex.slice(0,16)}..`);
+      return false;
+    }
+
+    if (this.unhandledMessageCount === 0) {
+      log(LOG_DEBUG, TAG, `No unhandled messages for ${this.destinationHashHex.slice(0,16)}.., nothing to sync`);
+      return false;
+    }
+
+    // Resolve destination from cached identity
+    const dest = this._resolveDestination();
+    if (!dest) {
+      log(LOG_DEBUG, TAG, `No identity cached for ${this.destinationHashHex.slice(0,16)}.., deferring sync`);
+      return false;
+    }
+
+    // Increment backoff immediately so retry waits even on mid-flight failure
+    this.syncBackoff += PEER_SYNC_BACKOFF_STEP;
+    this.nextSyncAttempt = Date.now() / 1000 + this.syncBackoff;
+    this.state = PEER_LINK_ESTABLISHING;
+
+    try {
+      // --- Establish link ---
+      this.link = Link.init(dest, this.router.transport);
+      this.router.transport.registerPendingLink(this.link);
+      await new Promise((resolve, reject) => {
+        this.link.on('established', resolve);
+        this.link.on('closed', () => reject(new Error('Link closed before establishment')));
+        setTimeout(() => reject(new Error('Link establishment timeout')), 30_000);
+      });
+
+      this.state = PEER_LINK_READY;
+      this.alive = true;
+      this.lastHeard = Date.now() / 1000;
+      this.syncBackoff = 0;
+      this.nextSyncAttempt = 0;
+
+      // --- Build offer ---
+      // Filter unhandled messages by transfer / sync limits (matches Python
+      // LXMPeer.sync():358-379). Skip stamp-cost filtering since the JS
+      // router defaults stamp_cost = 0.
+      const perMessageOverhead = 16;
+      const transferLimitBytes = (this.propagationTransferLimit || 256) * 1000;
+      const syncLimitBytes = (this.propagationSyncLimit || transferLimitBytes / 1000) * 1000;
+      let cumulativeSize = 24;
+
+      const offeredIds = [];
+      const offeredRawIds = [];
+      for (const tidHex of this.unhandledMessages) {
+        const entry = this.router.propagationEntries.get(tidHex);
+        if (!entry) {
+          this.removeUnhandledMessage(tidHex);
+          continue;
+        }
+        const lxmTransferSize = entry.size + perMessageOverhead;
+        // Drop messages that exceed the per-message transfer limit entirely.
+        if (lxmTransferSize > transferLimitBytes) {
+          log(LOG_DEBUG, TAG,
+            `Message ${tidHex.slice(0,16)}.. exceeds peer transfer limit, marking handled`);
+          this.removeUnhandledMessage(tidHex);
+          this.addHandledMessage(tidHex);
+          continue;
+        }
+        // Stop when per-sync cumulative limit would be exceeded.
+        if (cumulativeSize + lxmTransferSize >= syncLimitBytes) break;
+        cumulativeSize += lxmTransferSize;
+
+        const rawId = fromHex(tidHex);
+        offeredRawIds.push(rawId);
+        offeredIds.push(tidHex);
+      }
+
+      if (offeredIds.length === 0) {
+        this._teardown();
+        return false;
+      }
+
+      this.lastOffer = offeredIds;
+
+      // --- Generate peering key ---
+      // Matches Python: peering_id = router.identity.hash + remote_identity.hash
+      const localHash = this.router.propagationIdentity
+        ? this.router.propagationIdentity.hash : new Uint8Array(16);
+      const remoteHash = this.identity ? this.identity.hash : new Uint8Array(16);
+      const peeringId = concat(localHash, remoteHash);
+      const { stamp: peeringKey } = generatePeeringKey(peeringId, this.peeringCost || 0);
+      this.peeringKey = peeringKey;
+
+      // --- Send /offer request ---
+      this.state = PEER_REQUEST_SENT;
+      const offerPayload = [peeringKey, offeredRawIds];
+      const offerBytes = new Uint8Array(msgpackEncode(offerPayload));
+
+      // Note: the JS Link.request() encodes [timestamp, pathHash, data]
+      // automatically, so we pass the already-msgpack'd offer as the data field.
+      // The remote's /offer handler will receive and decode offerBytes.
+      const response = await this.link.request(OFFER_REQUEST_PATH, offerBytes, { timeout: 30_000 });
+
+      if (response == null) {
+        log(LOG_WARNING, TAG, `Offer request to ${this.destinationHashHex.slice(0,16)}.. timed out`);
+        this._teardown();
+        return false;
+      }
+
+      this.state = PEER_RESPONSE_RECEIVED;
+
+      // Decode the response (msgpack-encoded by the handler)
+      let decoded;
+      try { decoded = msgpackDecode(response); }
+      catch (err) {
+        log(LOG_WARNING, TAG, `Could not decode offer response: ${err.message}`);
+        this._teardown();
+        return false;
+      }
+
+      // --- Handle response ---
+      let wantedIds;
+      if (decoded === true) {
+        wantedIds = offeredIds.slice();
+      } else if (decoded === false) {
+        // Peer already has all; mark them handled locally.
+        for (const tidHex of this.lastOffer) {
+          this.addHandledMessage(tidHex);
+          this.removeUnhandledMessage(tidHex);
+        }
+        this.offered += this.lastOffer.length;
+        this._teardown();
+        return true;
+      } else if (Array.isArray(decoded)) {
+        const wantedSet = new Set(decoded.map((id) => toHex(new Uint8Array(id))));
+        // Mark not-wanted messages as handled immediately (peer already has them)
+        for (const tidHex of this.lastOffer) {
+          if (!wantedSet.has(tidHex)) {
+            this.addHandledMessage(tidHex);
+            this.removeUnhandledMessage(tidHex);
+          }
+        }
+        wantedIds = [...wantedSet];
+      } else if (typeof decoded === 'number') {
+        // Error code from remote
+        log(LOG_WARNING, TAG, `Remote peer returned error 0x${decoded.toString(16)}`);
+        if (decoded === ERROR_NO_ACCESS) {
+          this.router.unpeer(this.destinationHash);
+        }
+        this._teardown();
+        return false;
+      } else {
+        log(LOG_WARNING, TAG, `Unexpected offer response type: ${typeof decoded}`);
+        this._teardown();
+        return false;
+      }
+
+      if (wantedIds.length === 0) {
+        this.offered += this.lastOffer.length;
+        this._teardown();
+        return true;
+      }
+
+      // --- Send wanted messages as a Resource ---
+      const lxmList = [];
+      for (const tidHex of wantedIds) {
+        const entry = this.router.propagationEntries.get(tidHex);
+        if (entry && entry.data) lxmList.push(entry.data);
+      }
+
+      const resourceData = new Uint8Array(
+        msgpackEncode([Date.now() / 1000, lxmList.map((b) => Array.from(b))])
+      );
+
+      this.currentlyTransferringMessages = wantedIds;
+      this.state = PEER_RESOURCE_TRANSFERRING;
+      const transferStart = Date.now();
+
+      try {
+        await this.link.sendResource(resourceData, { timeoutMs: 120_000 });
+      } catch (err) {
+        log(LOG_WARNING, TAG, `Sync resource transfer to ${this.destinationHashHex.slice(0,16)}.. failed: ${err.message}`);
+        this.currentlyTransferringMessages = null;
+        this._teardown();
+        return false;
+      }
+
+      // --- Resource concluded successfully ---
+      // Move all transferred messages from unhandled → handled
+      for (const tidHex of wantedIds) {
+        this.addHandledMessage(tidHex);
+        this.removeUnhandledMessage(tidHex);
+      }
+
+      const durationSec = (Date.now() - transferStart) / 1000;
+      if (durationSec > 0) {
+        this.syncTransferRate = (resourceData.length * 8) / durationSec;
+      }
+
+      this.alive = true;
+      this.lastHeard = Date.now() / 1000;
+      this.offered += this.lastOffer.length;
+      this.outgoing += wantedIds.length;
+      this.txBytes += resourceData.length;
+
+      this.currentlyTransferringMessages = null;
+      this._teardown();
+
+      log(LOG_VERBOSE, TAG,
+        `Synced ${wantedIds.length} messages to ${this.destinationHashHex.slice(0,16)}..`);
+
+      // Persistent strategy: re-sync if more work remains
+      if (this.syncStrategy === STRATEGY_PERSISTENT && this.unhandledMessageCount > 0) {
+        setImmediate(() => this.sync().catch(() => {}));
+      }
+
+      return true;
+
+    } catch (err) {
+      log(LOG_WARNING, TAG, `Sync with ${this.destinationHashHex.slice(0,16)}.. failed: ${err.message}`);
+      this._teardown();
+      return false;
+    }
+  }
+
+  _teardown() {
+    if (this.link) {
+      try { this.link.close(); } catch {}
+      this.link = null;
+    }
+    this.state = PEER_IDLE;
   }
 }

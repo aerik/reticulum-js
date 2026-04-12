@@ -121,6 +121,7 @@ export class LXMRouter extends EventEmitter {
 
     // Outbound processing interval (matches Python's process_outbound 5-second tick)
     this._outboundInterval = null;
+    this._syncInterval = null;
     if (options.autoStart !== false) {
       this._outboundInterval = setInterval(() => {
         try { this._processOutbound(); } catch (err) {
@@ -128,6 +129,18 @@ export class LXMRouter extends EventEmitter {
         }
       }, 5000);
       if (this._outboundInterval.unref) this._outboundInterval.unref();
+
+      // Peer sync loop — drains the distribution queue then picks a peer
+      // to sync. Matches Python's sync_peers call cadence (~30s).
+      this._syncInterval = setInterval(() => {
+        try {
+          this.flushPeerDistributionQueue();
+          this.syncPeers();
+        } catch (err) {
+          log(LOG_WARNING, TAG, `Peer sync error: ${err.message}`);
+        }
+      }, 30_000);
+      if (this._syncInterval.unref) this._syncInterval.unref();
     }
   }
 
@@ -138,6 +151,10 @@ export class LXMRouter extends EventEmitter {
     if (this._outboundInterval) {
       clearInterval(this._outboundInterval);
       this._outboundInterval = null;
+    }
+    if (this._syncInterval) {
+      clearInterval(this._syncInterval);
+      this._syncInterval = null;
     }
   }
 
@@ -1411,6 +1428,37 @@ export class LXMRouter extends EventEmitter {
       transientIdHex,
       fromPeerHex: fromPeer ? fromPeer.destinationHashHex : null,
     });
+  }
+
+  /**
+   * Pick a peer that has pending work and initiate sync with it. Matches
+   * Python `LXMRouter.sync_peers()` in LXMF/LXMRouter.py:2021.
+   *
+   * Simplifications vs Python:
+   *   - No fastest-N random pool — we just pick the first waiting peer
+   *     with unhandled messages. Good enough until we have real load.
+   *   - No culling of unreachable peers here; that belongs in a separate
+   *     maintenance step (Phase 5).
+   */
+  syncPeers() {
+    const waiting = [];
+    for (const peer of this.peers.values()) {
+      if (peer.state === 0 /* PEER_IDLE */ && peer.unhandledMessageCount > 0 && peer.alive) {
+        waiting.push(peer);
+      }
+    }
+    if (waiting.length === 0) return null;
+
+    // Sort by transfer rate descending (fastest first), falling back to
+    // natural order for peers with no recorded rate.
+    waiting.sort((a, b) => (b.syncTransferRate || 0) - (a.syncTransferRate || 0));
+    const selected = waiting[0];
+
+    log(LOG_DEBUG, TAG, `Selected peer ${selected.destinationHashHex.slice(0,16)}.. for sync (${selected.unhandledMessageCount} pending)`);
+    selected.sync().catch((err) => {
+      log(LOG_WARNING, TAG, `Sync with ${selected.destinationHashHex.slice(0,16)}.. threw: ${err.message}`);
+    });
+    return selected;
   }
 
   /**
