@@ -156,6 +156,60 @@ export function generatePnStamp(transientId, targetCost) {
 }
 
 /**
+ * Generate a peering key — a proof-of-work stamp proving the requester is
+ * willing to spend CPU to establish a peering relationship. Matches Python
+ * LXStamper.generate_peering_key() which uses
+ * WORKBLOCK_EXPAND_ROUNDS_PEERING (25) on a `peering_id` = concat(two
+ * identity hashes).
+ *
+ * @param {Uint8Array} peeringId - Concat of local identity hash + remote
+ * @param {number} targetCost - Required leading zero bits
+ * @returns {{ stamp: Uint8Array, value: number, attempts: number, durationMs: number }}
+ */
+export function generatePeeringKey(peeringId, targetCost) {
+  const startTime = Date.now();
+  const workblock = stampWorkblock(peeringId, WORKBLOCK_EXPAND_ROUNDS_PEERING);
+  const baseHasher = nobleSha256.create();
+  baseHasher.update(workblock);
+
+  // Fast path: cost 0 → any stamp is valid, return a random one immediately.
+  if (targetCost <= 0) {
+    const stamp = randomBytes(STAMP_SIZE);
+    return { stamp, value: 0, attempts: 1, durationMs: Date.now() - startTime };
+  }
+
+  let attempts = 0;
+  while (true) {
+    const stamp = randomBytes(STAMP_SIZE);
+    attempts++;
+    const digest = baseHasher.clone().update(stamp).digest();
+    const value = leadingZeroBits(digest);
+    if (value >= targetCost) {
+      return { stamp, value, attempts, durationMs: Date.now() - startTime };
+    }
+    if (attempts > (1 << Math.min(targetCost + 4, 24))) {
+      throw new Error(
+        `generatePeeringKey gave up after ${attempts} attempts (cost=${targetCost})`);
+    }
+  }
+}
+
+/**
+ * Validate a peering key against the target cost. Matches Python
+ * LXStamper.validate_peering_key().
+ * @param {Uint8Array} peeringId
+ * @param {Uint8Array} peeringKey
+ * @param {number} targetCost
+ * @returns {boolean}
+ */
+export function validatePeeringKey(peeringId, peeringKey, targetCost) {
+  if (targetCost <= 0) return true; // cost 0 → any non-null key passes
+  if (!peeringKey || peeringKey.length !== STAMP_SIZE) return false;
+  const workblock = stampWorkblock(peeringId, WORKBLOCK_EXPAND_ROUNDS_PEERING);
+  return stampValid(peeringKey, targetCost, workblock);
+}
+
+/**
  * Validate a list of propagation-node stamps in a transient list.
  * Matches Python LXStamper.validate_pn_stamps_job_simple().
  *

@@ -17,7 +17,7 @@
 import { EventEmitter } from '../utils/events.js';
 import { Destination } from '../Destination.js';
 import { Identity } from '../Identity.js';
-import { Link, ACCEPT_APP } from '../Link.js';
+import { Link, ACCEPT_APP, ACCEPT_ALL } from '../Link.js';
 import { Packet } from '../Packet.js';
 import {
   LXMessage, LXMF_OVERHEAD, DESTINATION_LENGTH, SIGNATURE_LENGTH,
@@ -25,9 +25,10 @@ import {
   OUTBOUND, SENDING, SENT, DELIVERED, FAILED,
 } from './LXMessage.js';
 import { LXMPeer } from './LXMPeer.js';
-import { APP_NAME, MESSAGE_GET_PATH, MESSAGE_EXPIRY,
-         ERROR_NO_IDENTITY, ERROR_NO_ACCESS, PROPAGATION_LIMIT,
-         DELIVERY_LIMIT, STRATEGY_PERSISTENT, PN_META_NAME } from './constants.js';
+import { validatePeeringKey } from './LXStamper.js';
+import { APP_NAME, MESSAGE_GET_PATH, OFFER_REQUEST_PATH, MESSAGE_EXPIRY,
+         ERROR_NO_IDENTITY, ERROR_NO_ACCESS, ERROR_INVALID_DATA, ERROR_INVALID_KEY,
+         PROPAGATION_LIMIT, DELIVERY_LIMIT, STRATEGY_PERSISTENT, PN_META_NAME } from './constants.js';
 import { sha256Hash, truncatedHash } from '../utils/crypto.js';
 import { concat, toHex, equal, fromUtf8 } from '../utils/bytes.js';
 import { log, LOG_DEBUG, LOG_INFO, LOG_WARNING, LOG_ERROR } from '../utils/log.js';
@@ -1298,15 +1299,137 @@ export class LXMRouter extends EventEmitter {
   _propagationLinkEstablished(link) {
     log(LOG_INFO, TAG, `Propagation link established`);
 
-    // Register /get request handler (matching Python message_get_request)
-    link.onRequest(MESSAGE_GET_PATH, (data, requestId) => {
-      return this._messageGetRequest(data, link);
+    // /get handler — clients pulling stored messages. The Link dispatch
+    // layer hands us raw request bytes; we msgpack-decode here and
+    // msgpack-encode the response so _messageGetRequest can work with
+    // structured data. Matches Python LXMRouter.message_get_request().
+    link.registerRequestHandler(MESSAGE_GET_PATH, async (requestData) => {
+      try {
+        const decoded = requestData && requestData.length > 0
+          ? msgpackDecode(requestData) : [null, null];
+        const response = this._messageGetRequest(decoded, link);
+        return new Uint8Array(msgpackEncode(response));
+      } catch (err) {
+        log(LOG_WARNING, TAG, `Error in /get handler: ${err.message}`);
+        return null;
+      }
     });
 
-    // Accept resources (for incoming propagated messages)
+    // /offer handler — peers pushing sync offers. Matches Python
+    // LXMRouter.offer_request().
+    link.registerRequestHandler(OFFER_REQUEST_PATH, async (requestData) => {
+      try {
+        const decoded = requestData ? msgpackDecode(requestData) : null;
+        const response = this._offerRequest(decoded, link);
+        return new Uint8Array(msgpackEncode(response));
+      } catch (err) {
+        log(LOG_WARNING, TAG, `Error in /offer handler: ${err.message}`);
+        return null;
+      }
+    });
+
+    // Accept resources (for incoming propagated messages). When a peer
+    // sends us messages via Resource, the receiver emits 'resource_complete'.
+    link.setResourceStrategy(ACCEPT_ALL);
+    link.on('resource_complete', (data) => {
+      this._propagationReceiveData(data);
+    });
     link.on('data', (plaintext) => {
       this._propagationReceiveData(plaintext);
     });
+  }
+
+  /**
+   * /offer handler. Called when a peer sends us a sync offer on the
+   * propagation link. Matches Python `LXMRouter.offer_request()` in
+   * LXMF/LXMRouter.py:2139.
+   *
+   * Request format: `[peeringKey, [transientId, ...]]`
+   * Response:
+   *   - `true`  → we want all offered messages
+   *   - `false` → we already have all offered messages
+   *   - `[wantedIds]` → we want this subset
+   *   - numeric error code → rejection
+   *
+   * @param {any} data
+   * @param {import('../Link.js').Link} link
+   */
+  _offerRequest(data, link) {
+    if (!Array.isArray(data) || data.length < 2) {
+      return ERROR_INVALID_DATA;
+    }
+
+    const peeringKey = data[0] != null ? new Uint8Array(data[0]) : null;
+    const transientIds = data[1];
+    if (!Array.isArray(transientIds)) return ERROR_INVALID_DATA;
+
+    // Validate the peering key against our configured peering cost.
+    // Matches Python: peering_id = self.identity.hash + remote_identity.hash
+    // We don't have the remote identity here directly; Python gets it from
+    // the link's remote_identity. For now we use the link id as a stand-in
+    // when identity is not attached. Validation is skipped entirely when
+    // peeringCost == 0 (the default).
+    if (this.peeringCost > 0) {
+      const localHash = this.propagationIdentity
+        ? this.propagationIdentity.hash : new Uint8Array(16);
+      const remoteHash = (link.destination && link.destination.identity)
+        ? link.destination.identity.hash
+        : (link.linkId || new Uint8Array(16));
+      const peeringId = concat(localHash, remoteHash);
+      if (!validatePeeringKey(peeringId, peeringKey, this.peeringCost)) {
+        log(LOG_DEBUG, TAG, 'Invalid peering key for incoming /offer');
+        return ERROR_INVALID_KEY;
+      }
+    }
+
+    // Compute which offered IDs we don't already have.
+    const wantedIds = [];
+    for (const tid of transientIds) {
+      const tidHex = toHex(new Uint8Array(tid));
+      if (!this.propagationEntries.has(tidHex)) {
+        wantedIds.push(new Uint8Array(tid));
+      }
+    }
+
+    if (wantedIds.length === 0) return false;
+    if (wantedIds.length === transientIds.length) return true;
+    return wantedIds;
+  }
+
+  // --- Peer distribution queue ---
+  //
+  // Matches Python `LXMRouter.enqueue_peer_distribution` and
+  // `flush_peer_distribution_queue` in LXMF/LXMRouter.py:2289-2305.
+
+  /**
+   * Queue a stored message for distribution to all connected peers.
+   * @param {string} transientIdHex
+   * @param {LXMPeer|null} fromPeer - The peer we got this from, or null
+   */
+  enqueuePeerDistribution(transientIdHex, fromPeer = null) {
+    this.peerDistributionQueue.push({
+      transientIdHex,
+      fromPeerHex: fromPeer ? fromPeer.destinationHashHex : null,
+    });
+  }
+
+  /**
+   * Drain the distribution queue, fanning each message out to every peer
+   * except the one it came from. The message gets added to each peer's
+   * unhandled messages list; actual sync happens later in sync_peers().
+   */
+  flushPeerDistributionQueue() {
+    if (this.peerDistributionQueue.length === 0) return;
+
+    const entries = this.peerDistributionQueue.splice(0);
+    for (const [peerHex, peer] of this.peers) {
+      for (const { transientIdHex, fromPeerHex } of entries) {
+        if (peerHex !== fromPeerHex) {
+          peer.queueUnhandledMessage(transientIdHex);
+        }
+      }
+      peer.processQueues();
+    }
   }
 
   /**
@@ -1410,7 +1533,7 @@ export class LXMRouter extends EventEmitter {
    * @param {Uint8Array} lxmfData - Raw LXMF data (dest_hash + encrypted_blob + ?propagation_stamp)
    * @returns {boolean}
    */
-  _lxmfPropagation(lxmfData) {
+  _lxmfPropagation(lxmfData, fromPeer = null) {
     if (lxmfData.length < LXMF_OVERHEAD) return false;
 
     // Compute transient_id from the data WITHOUT the propagation stamp
@@ -1466,6 +1589,11 @@ export class LXMRouter extends EventEmitter {
       if (this.propagationEntries.size > this.storageLimit) {
         this._pruneOldestMessages();
       }
+
+      // Queue for fan-out to peers (matches Python lxmf_propagation which
+      // calls enqueue_peer_distribution(transient_id, from_peer) after
+      // storing a new message).
+      this.enqueuePeerDistribution(tidHex, fromPeer);
 
       log(LOG_INFO, TAG, `Stored propagated message ${tidHex.slice(0, 16)}.. for ${destHex.slice(0, 16)}..`);
       return true;
