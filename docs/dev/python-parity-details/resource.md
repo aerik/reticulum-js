@@ -1,13 +1,16 @@
 # Resource.js vs RNS/Resource.py — Parity Detail
 
-Source: parallel audit agent, 2026-04-11.
+Source: parallel audit agent, 2026-04-11. Last updated 2026-04-13.
 
 ## Summary
 
-Core wire protocol (advertisement, parts, HMU, proof) matches after commit
-9180b98 fixes. Missing: the entire watchdog/retry infrastructure, adaptive
-window tuning, AWAITING_PROOF state tracking, auto-compression (task #39),
-multi-segment (task #38), metadata, input_file streaming.
+Core wire protocol (advertisement, parts, HMU, proof), watchdog/retry
+infrastructure, AWAITING_PROOF state, multi-segment split transfers, and
+auto-compression (via a pluggable encoder) all match Python. Still
+missing: adaptive window tuning (EIFR-based rate adaptation — our
+simpler RTT×outstanding approximation works but is less precise),
+metadata (FLAG_HAS_METADATA parsed but unused on send), and input_file
+streaming (we require Uint8Array in memory, no file-handle chunking).
 
 Known issues documented separately in `docs/resource-transfer-issues.md` are
 not re-reported here.

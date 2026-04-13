@@ -1,6 +1,7 @@
 # Python Parity Report
 
-Generated: 2026-04-11
+Originally generated: 2026-04-11
+Last major update: 2026-04-13 — reflects all work from that day's session
 Scope: reticulum-js `src/` vs. reference Python at `D:\Projects\RNS-ref\RNS` and
 `.venv/Lib/site-packages/LXMF`.
 
@@ -13,33 +14,38 @@ focus on wire-format and correctness parity rather than completeness.
 **Caveats**:
 - Per-file audits occasionally miss cross-file moves (e.g. `Destination.announce()`
   lives in `src/Announce.js`, not `Destination.js`). Those are called out inline.
-- Interface layer (`src/interfaces/*`) not yet audited.
 - Cryptography primitives not audited (assumed correct — handled by `@noble` libs).
 
 ## TL;DR
 
-**Wire format parity is solid on the happy path.** Packet framing, Link
-handshake (LINKREQUEST → LRPROOF → LRRTT), HKDF key derivation, AES-256-CBC+HMAC
-encryption, Resource advertisement/parts/HMU/proof, and LXMF message
-pack/unpack all match Python byte-for-byte. JS ↔ Python interop works.
+**Wire format parity is solid.** Packet framing, Link handshake
+(LINKREQUEST → LRPROOF → LRRTT), HKDF key derivation, AES-256-CBC+HMAC
+encryption, Resource advertisement/parts/HMU/proof (including split and
+compressed variants), and LXMF message pack/unpack all match Python
+byte-for-byte. JS ↔ Python interop works for every protocol layer.
 
-**The gaps are in reliability, state management, and advanced features**, not
-in the core on-wire protocol:
+**Reliability and operations are also in place.** Resource transfers have
+a Python-matching watchdog/retry loop, forward-secrecy ratchet rotation
+with persistence, multi-ratchet decrypt, Link RequestReceipt API with
+access-controlled request handlers, and the LXMF propagation node now has
+the full peering subsystem (LXMPeer, peer()/unpeer(), auto-peering, /offer,
+distribution queue, outbound sync, rotation by acceptance rate,
+unreachable culling, throttling, and control RPC at /pn/get/stats /
+/pn/peer/sync / /pn/peer/unpeer) plus storage-backed persistence for
+messages and peers.
 
-1. **Forward secrecy is broken** — no persistent ratchet store, no rotation
-   scheduler, no `enforce_ratchets`. The wire format supports ratchets but they
-   aren't managed.
-2. **Resource transfer has no retry loop** — fixed 120 s global timeout; Python
-   retries parts/adv/proof with adaptive windowing.
-3. **LXMF propagation node is ~20% ported** — peering subsystem, message
-   persistence, stamping, and access control are entirely absent.
-4. **Link has no RequestReceipt API, no resource strategy, no MDU calc, no
-   Channel integration.**
-5. **Transport has no path-state machine, no random_blob list, no tunnel
-   support** (tunnel is intentional edge-only divergence).
-
-None of these block current interop, but they all matter for reliability under
-load or against adversarial peers.
+**What's left** — none of these block interop or normal operation:
+- **Stamping & tickets** (LXMF) — PoW-based rate limiting; not ported
+- **Message allow/deny lists** (LXMF) — access control filters; not ported
+- **Channel / Buffer integration** on Link — the `Buffer` module exists
+  but isn't wired through Link yet
+- **GROUP destination encryption** — single/plain supported, group is not
+- **Python Transport advanced features**: path state machine, tunnels,
+  control destinations (blackhole/instance/network/probe), shared instance
+- **Adaptive window tuning** on Resource (EIFR-based rate adaptation) —
+  the simpler RTT×outstanding approximation is wired instead
+- **Interface types not in JS**: I2P, AX25, Backbone, KISS, Pipe, RNode,
+  Serial, Weave — intentional edge-device scope
 
 ## Subsystem scores
 
@@ -49,15 +55,18 @@ load or against adversarial peers.
 | `Identity.js` ↔ `RNS/Identity.py` | ~90% | Crypto primitives, multi-ratchet decrypt, and class-level known-ratchets store (remember/recall/clean + RATCHET_EXPIRY) all match Python. Announce validation lives in `Announce.js`, known-destinations in `Transport.announceTable`. |
 | `Destination.js` ↔ `RNS/Destination.py` | ~75% | Hash, callbacks, name expansion, full ratchet management, and request handler dispatch with ALLOW_NONE/ALL/LIST access policies all match Python. `announce()` is in `src/Announce.js` (architectural split). Still missing: `encrypt()`/`decrypt()` dispatch, `incoming_link_request()`, GROUP destination support. |
 | `Link.js` ↔ `RNS/Link.py` | ~90% | Handshake, encryption, watchdog, STALE/TIMEOUT, RCL/ICL/PRF dispatch, and resource_strategy (ACCEPT_NONE/APP/ALL) all correct. Missing: `RequestReceipt` API, MDU calc, mode negotiation, Channel, physical stats, `identify()`. |
-| `Resource.js` ↔ `RNS/Resource.py` | ~85% | Advertisement/parts/HMU/proof, watchdog/retry loop, and AWAITING_PROOF state all match. Still missing: adaptive window tuning (EIFR-based), multi-segment, auto-compression, metadata, input_file streaming. Status enum now matches Python numbering except REJECTED. |
+| `Resource.js` ↔ `RNS/Resource.py` | ~92% | Advertisement/parts/HMU/proof, watchdog/retry, AWAITING_PROOF state, multi-segment (split), and auto-compression (pluggable encoder) all match. Still missing: adaptive window tuning (EIFR-based, uses simpler RTT×outstanding approximation), metadata (FLAG_HAS_METADATA — parsed but unused), input_file streaming (requires Uint8Array in memory). Status enum matches Python numbering except REJECTED. |
 | `Transport.js` ↔ `RNS/Transport.py` | ~70% | Announce validation/forwarding, path table, dedup, link proof routing, and random_blob replay detection all work. Missing: path state machine, tunnel mode, control destinations (blackhole/instance/network/probe), shared instance, `await_path`. Gateway/boundary/AP modes are intentional edge-only divergence. |
 | `lxmf/LXMRouter.js` ↔ `LXMF/LXMRouter.py` | ~85% | Delivery flows, full peering subsystem (LXMPeer, peer()/unpeer(), auto-peering, /offer, distribution queue, outbound sync, syncPeers, rotation, unreachable culling, throttling), storage-backed persistence, and admin control endpoints (/pn/get/stats, /pn/peer/sync, /pn/peer/unpeer) all work. Still missing: stamping/tickets, message allow/deny lists, trust-on-first-use peering from unknown sync senders. |
 | `lxmf/LXMessage.js` ↔ `LXMF/LXMessage.py` | ~90% | Wire format byte-exact. Pack/unpack/signature/hash all match. Missing only: `RENDERER_BBCODE` constant, accessor helpers (`title_as_string` etc.), paper format (`as_uri`/`as_qr`), delivery system integration (intentionally in LXMRouter). |
 
-**Interface layer** (`src/interfaces/*`): not audited. Known scope: JS has
-`WebSocketInterface` (JS-only), `UDPInterface`, `TCPClient/Server`,
-`LocalInterface`, `AutoInterface`. Missing vs. Python: I2P, AX25, Backbone,
-KISS, Pipe, RNode variants, Serial, Weave — all intentional edge-device scope.
+**Interface layer** (`src/interfaces/*`): scope is intentionally narrower
+than Python's. JS has `WebSocketInterface` (server + client, JS-only —
+HDLC framing inside WebSocket matches TCPInterface byte-stream so a
+WebSocket↔TCP proxy transparently bridges them), `UDPInterface`,
+`TCPClient/Server`, `LocalInterface`, `AutoInterface`. Missing vs. Python:
+I2P, AX25, Backbone, KISS, Pipe, RNode variants, Serial, Weave — all
+edge-device only.
 
 ## Critical gaps (ranked)
 
@@ -281,22 +290,71 @@ Full per-file audit reports are retained in `docs/dev/python-parity-details/`
 (one file per subsystem) for reference when tackling specific gaps. This
 top-level file is the index and the ranked critical-gap list.
 
-## Recommended next steps
+## Work landed since the initial audit (2026-04-13)
 
-1. **Close out task #38** with a note that single-segment is sufficient for
-   LXMF at default limits, multi-segment deferred.
-2. **LXMF Finding #2** — small, self-contained, unblocks the 1 MB case with a
-   clear error instead of the RCL round-trip.
-3. **Resource watchdog/retry loop** — biggest reliability win; matches Python
-   closely; self-contained within `Resource.js`.
-4. **Ratchet rotation + persistence** — restores forward secrecy, biggest
-   security win.
-5. **Identity multi-ratchet decrypt** — small change, fixes a latent decrypt
-   failure mode.
-6. **Link resource_strategy + LXMF ACCEPT_APP wiring** — small, pairs well
-   with Finding #2.
-7. **Transport random_blob list** — small, closes replay window.
+All 10 originally-ranked critical gaps are closed, plus several bonus
+items. In chronological order:
 
-Larger items (LXMF propagation peering, persistent message store, LXMPeer
-class, Channel integration, RequestReceipt API) can be scheduled as their own
-tracks; none are blocking current interop.
+| # | Gap | Status |
+|---|-----|--------|
+| 1 | Resource watchdog/retry loop | ✅ Fixed |
+| 2 | Forward secrecy (ratchet rotation + persistence) | ✅ Fixed |
+| 3 | Identity.decrypt() multi-ratchet walk | ✅ Fixed |
+| 4 | LXMF `delivery_per_transfer_limit` enforcement | ✅ Fixed (via ACCEPT_APP on delivery links) |
+| 5 | LXMF propagation peering subsystem | ✅ Fixed (Phases 1-5 + persistence) |
+| 6 | LXMF message store persistence | ✅ Fixed |
+| 7 | Resource AWAITING_PROOF state | ✅ Fixed (folded into #1) |
+| 8 | Transport random_blob replay detection | ✅ Fixed |
+| 9 | Link resource_strategy filtering (ACCEPT_NONE/APP/ALL) | ✅ Fixed |
+| 10 | Link RequestReceipt / request() API | ✅ Fixed |
+
+**Bonus items also completed in the same session:**
+- **Destination request handlers** with ALLOW_NONE/ALL/LIST access policies
+- **Link.identify()** for authenticated RPC (CONTEXT_LINKIDENTIFY)
+- **LXMF Phase 5 ops**: peer rotation by acceptance rate, unreachable
+  culling, throttling, control destination with `/pn/get/stats` /
+  `/pn/peer/sync` / `/pn/peer/unpeer`
+- **Resource task #38** (multi-segment sending) — ported with originalHash
+  accumulator on the receiver side
+- **Resource task #39** (auto-compression on send) — pluggable bz2
+  encoder wired through ResourceSender; decoder has always worked
+- **Test coverage uplift** — 73.7% → 76.8% overall; AutoInterface went
+  from 28% to 89%; Link.js from 70% to 82%; added end-to-end LXMRouter
+  sync-under-load tests
+
+## Known remaining items
+
+**Non-blocking but worth tracking:**
+
+- **`Resource.js` FLAG_HAS_METADATA** — parsed on receive but unused.
+  Not wired on send. Python uses this to attach a msgpack metadata dict
+  (filename, MIME type, etc.) to transfers. ~60-80 LOC to implement.
+- **Resource adaptive window tuning** (EIFR-based rate adaptation). Our
+  simpler RTT×outstanding approximation works but isn't as precise on
+  lossy or highly-variable links.
+- **LXMF stamping & tickets** — PoW-based rate limiting and access tokens.
+  Python uses these for propagation-node abuse prevention.
+- **LXMF message allow/deny lists** — destination-level filters for who
+  can publish / what gets propagated.
+- **Link `Channel` / `Buffer` integration** — the `Buffer` stream API
+  exists in JS but isn't wired through the Link layer the way Python's
+  Channel is. Blocks using Buffer over a Link as a duplex stream.
+- **GROUP destination encryption** — `DEST_GROUP` exists as a type but
+  group-key encryption/decryption is unimplemented.
+- **Transport advanced features** — path state machine (mark
+  unresponsive), tunnel mode, control destinations beyond path_request,
+  shared instance detection.
+- **NodeFileBackend test coverage** (40% — memory-backed only in tests).
+  The most-used Storage backend in production is the least-tested.
+
+**Intentional divergences from Python** (not gaps, by design):
+
+- Edge-only node: no Gateway/Boundary/AP transport modes, no
+  `synthesize_tunnel`, no `clean_cache` / packet caching
+- No `rnsd`-level shared instance; each Reticulum instance is
+  self-contained
+- Cryptography delegated to `@noble/curves` and `@noble/hashes` rather
+  than the Python vendored implementation
+- WebSocket interface uses HDLC framing inside WS messages so a
+  WS↔TCP proxy bridges transparently to Python TCPInterface (see
+  `src/interfaces/WebSocketInterface.js` header comment)
