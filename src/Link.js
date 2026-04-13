@@ -142,6 +142,12 @@ export class Link extends EventEmitter {
 
     // Incoming resource tracking
     this._activeResource = null;
+    // Multi-segment receive accumulator — keyed by original_hash hex.
+    // Each entry collects segments of a split transfer until the final
+    // segment arrives, then fires resource_complete with the concatenated
+    // data. Matches Python's receiver-side file-append assembly at
+    // RNS/Resource.py:685-738 keyed by original_hash.
+    this._segmentedReceives = new Map();
 
     // Resource acceptance strategy — matches Python RNS/Link.py:120-122,242.
     // Default is ACCEPT_NONE (ignore all incoming resource advertisements).
@@ -711,27 +717,88 @@ export class Link extends EventEmitter {
 
       this._activeResource = receiver;
 
-      receiver.onComplete((data) => {
-        log(LOG_INFO, TAG, `Resource complete: ${data.length} bytes, requestId=${receiver.requestId ? toHex(receiver.requestId).slice(0,16) : 'null'}, pendingRequests=${this._pendingRequests.size}`);
+      const isSplit = receiver.totalSegments > 1;
+      const originalHashHex = toHex(receiver.originalHash);
 
-        // Check if this is a response to a pending request
-        if (receiver.requestId || this._pendingRequests.size > 0) {
-          try {
-            const unpacked = msgpackDecode(data);
-            if (Array.isArray(unpacked) && unpacked.length >= 2) {
-              log(LOG_DEBUG, TAG, `Resource response: request_id=${toHex(new Uint8Array(unpacked[0])).slice(0,16)}, data=${unpacked[1] ? unpacked[1].length + 'b' : 'null'}`);
-              this._handleResponse(data);
-              return;
-            }
-          } catch (err) {
-            log(LOG_WARNING, TAG, `Resource response parse failed: ${err.message}`);
-          }
+      if (isSplit) {
+        // Multi-segment transfer. Maintain a per-original-hash accumulator
+        // that collects segments until the final one arrives.
+        let accumulator = this._segmentedReceives.get(originalHashHex);
+        if (!accumulator) {
+          accumulator = {
+            originalHash: receiver.originalHash,
+            totalSegments: receiver.totalSegments,
+            segments: new Map(), // segmentIndex → Uint8Array data
+          };
+          this._segmentedReceives.set(originalHashHex, accumulator);
+          log(LOG_INFO, TAG,
+            `Multi-segment transfer started: ${receiver.totalSegments} segments, ` +
+            `original_hash=${originalHashHex.slice(0, 16)}..`);
         }
 
-        // Otherwise emit as generic resource data
-        this.emit('resource_complete', data, receiver);
-        this._activeResource = null;
-      });
+        receiver.onComplete((data) => {
+          accumulator.segments.set(receiver.segmentIndex, data);
+          log(LOG_INFO, TAG,
+            `Segment ${receiver.segmentIndex}/${accumulator.totalSegments} complete ` +
+            `(${data.length}b)`);
+
+          if (accumulator.segments.size === accumulator.totalSegments) {
+            // All segments received — concatenate in order and fire complete.
+            let total = 0;
+            for (const s of accumulator.segments.values()) total += s.length;
+            const combined = new Uint8Array(total);
+            let offset = 0;
+            for (let i = 1; i <= accumulator.totalSegments; i++) {
+              const seg = accumulator.segments.get(i);
+              combined.set(seg, offset);
+              offset += seg.length;
+            }
+            this._segmentedReceives.delete(originalHashHex);
+            this._activeResource = null;
+            log(LOG_INFO, TAG,
+              `Multi-segment transfer complete: ${combined.length} bytes ` +
+              `in ${accumulator.totalSegments} segments`);
+
+            // Check if this is a response to a pending request
+            if (receiver.requestId || this._pendingRequests.size > 0) {
+              try {
+                const unpacked = msgpackDecode(combined);
+                if (Array.isArray(unpacked) && unpacked.length >= 2) {
+                  this._handleResponse(combined);
+                  return;
+                }
+              } catch {}
+            }
+
+            this.emit('resource_complete', combined, receiver);
+          } else {
+            // More segments expected — wait for the next ADV
+            this._activeResource = null;
+          }
+        });
+      } else {
+        // Single-segment (normal) transfer
+        receiver.onComplete((data) => {
+          log(LOG_INFO, TAG, `Resource complete: ${data.length} bytes, requestId=${receiver.requestId ? toHex(receiver.requestId).slice(0,16) : 'null'}, pendingRequests=${this._pendingRequests.size}`);
+
+          // Check if this is a response to a pending request
+          if (receiver.requestId || this._pendingRequests.size > 0) {
+            try {
+              const unpacked = msgpackDecode(data);
+              if (Array.isArray(unpacked) && unpacked.length >= 2) {
+                log(LOG_DEBUG, TAG, `Resource response: request_id=${toHex(new Uint8Array(unpacked[0])).slice(0,16)}, data=${unpacked[1] ? unpacked[1].length + 'b' : 'null'}`);
+                this._handleResponse(data);
+                return;
+              }
+            } catch (err) {
+              log(LOG_WARNING, TAG, `Resource response parse failed: ${err.message}`);
+            }
+          }
+
+          this.emit('resource_complete', data, receiver);
+          this._activeResource = null;
+        });
+      }
 
       receiver.accept().catch(err => {
         log(LOG_WARNING, TAG, `Resource accept failed: ${err.message}`);
@@ -1221,11 +1288,26 @@ export class Link extends EventEmitter {
       throw new Error('Link is not active');
     }
 
-    const sender = new ResourceSender(this, data);
-    const hashHex = toHex(sender.hash);
+    const sender = new ResourceSender(this, data, options);
+    let hashHex = toHex(sender.hash);
     const timeoutMs = options.timeoutMs || 120_000;
 
     if (options.onProgress) sender.onProgress(options.onProgress);
+
+    // Re-key the outgoing resources map when the sender advances to the
+    // next segment of a split transfer — the hash changes per segment but
+    // the entry should stay available for RESOURCE_REQ / RESOURCE_PRF
+    // dispatch under the new hash.
+    sender.onSegmentAdvance((oldHash, newHash) => {
+      const oldKey = toHex(oldHash);
+      const newKey = toHex(newHash);
+      const entry = this._outgoingResources.get(oldKey);
+      if (entry) {
+        this._outgoingResources.delete(oldKey);
+        this._outgoingResources.set(newKey, entry);
+        hashHex = newKey;
+      }
+    });
 
     // Make sure we're listening for 'resource_req' / 'resource_proof' events
     // dispatched from Transport when the corresponding context arrives.

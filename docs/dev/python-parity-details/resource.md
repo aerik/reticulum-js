@@ -40,7 +40,7 @@ not re-reported here.
 
 | Symbol | Status |
 |--------|--------|
-| MAX_EFFICIENT_SIZE | MISSING (task #38) |
+| MAX_EFFICIENT_SIZE | MATCHED | 1 MiB - 1; exported from Resource.js |
 | AUTO_COMPRESS_MAX_SIZE | MATCHED | 64 MiB; exported from Resource.js |
 
 ### Retry / timeout
@@ -101,7 +101,7 @@ not re-reported here.
 | Encryption (full stream, not per-packet) | MATCHED | |
 | Compression (bz2) | PARTIAL | Sender path fully wired: `autoCompress` option, size limit check, "only use compressed if smaller" decision, FLAG_COMPRESSED flag bit, hash computed on uncompressed data. A `compressBz2(data)` encoder must be registered via `setCompressor()` in src/utils/compress.js — no bz2 encoder bundled. Receiver-side decompression has always worked (seek-bzip vendored decoder). |
 | Metadata support | PARTIAL | FLAG unpacked, never used |
-| Multi-segment (split) | MISSING (task #38) | |
+| Multi-segment (split) | MATCHED | Sender splits payloads >MAX_EFFICIENT_SIZE into segments; each has its own hash/randomHash/transferData but shares originalHash (segment 1's hash). FLAG_SPLIT set in advertisement. Link layer accumulates segments by originalHash and fires resource_complete with concatenated data. Sequential send (no pipelined pre-creation like Python's prepare_next_segment). |
 | watchdog_job / threading | MATCHED | setInterval-based; same state-branch logic as Python's __watchdog_job |
 | Progress tracking / callback | MATCHED | |
 

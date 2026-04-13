@@ -93,6 +93,14 @@ const TRAFFIC_TIMEOUT_FACTOR = 6;
  */
 export const AUTO_COMPRESS_MAX_SIZE = 64 * 1024 * 1024;
 
+/**
+ * Maximum bytes in a single Resource segment. Payloads larger than this
+ * are split into multiple segments, each sent as its own Resource cycle
+ * but sharing the same originalHash so the receiver can reassemble.
+ * Matches Python RNS/Resource.py constant (1 MiB - 1 = 1,048,575).
+ */
+export const MAX_EFFICIENT_SIZE = 1024 * 1024 - 1;
+
 // Flags
 const FLAG_ENCRYPTED    = 0x01;
 const FLAG_COMPRESSED   = 0x02;
@@ -125,7 +133,8 @@ export class ResourceSender {
    */
   constructor(link, data, options = {}) {
     this.link = link;
-    this.originalData = data;
+    this.fullData = data;  // The complete payload across all segments
+    this.totalSize = data.length;
     this.requestId = options.requestId || null;
     this.encryptedFlag = options.encrypted !== false;
     this.status = RESOURCE_NONE;
@@ -148,30 +157,91 @@ export class ResourceSender {
     this.autoCompressLimit = autoCompressLimit;
     this.autoCompress = autoCompressEnabled;
 
+    // --- Segmentation decision ---
+    // Payloads larger than MAX_EFFICIENT_SIZE are split into multiple
+    // segments, each sent as its own Resource cycle with the same
+    // originalHash. Matches Python RNS/Resource.py:272-312.
+    if (data.length > MAX_EFFICIENT_SIZE) {
+      this.totalSegments = Math.ceil(data.length / MAX_EFFICIENT_SIZE);
+      this.split = true;
+    } else {
+      this.totalSegments = 1;
+      this.split = false;
+    }
+    this.segmentIndex = 0;   // set in _loadSegment
+    this.originalHash = null; // set after segment 1 hash is computed
+
+    // Derive SDU from link MTU (matching Python: link.mtu - 36)
+    this.sdu = (link.mtu || MTU) - SDU_OVERHEAD;
+
+    // Callbacks
+    this.sentParts = 0;
+    this.lastPartSent = 0;
+    this.progress = 0;
+    this._onComplete = null;
+    this._onProgress = null;
+    this._onFailed = null;
+    // Called from _loadSegment when advancing to a new segment so the Link
+    // layer can re-key its outgoing resources map (the per-segment hash
+    // changes but originalHash stays stable).
+    this._onSegmentAdvance = null;
+
+    // Watchdog / retry tracking — mirrors Python RNS/Resource.py:339-347
+    this._watchdogTimer = null;
+
+    // Load segment 1 — computes hash, compresses if beneficial, builds
+    // transferData. Subsequent segments are loaded by advancing via
+    // _loadSegment(segmentIndex+1) after the current segment's proof arrives.
+    this._loadSegment(1);
+  }
+
+  /**
+   * Reset per-segment state and prepare the given segment for transfer.
+   * Matches Python's pattern of building `self.data` for one segment at a
+   * time — segment 1 computes `originalHash`; later segments reuse it.
+   * @param {number} segmentIndex - 1-based segment number
+   */
+  _loadSegment(segmentIndex) {
+    if (segmentIndex < 1 || segmentIndex > this.totalSegments) {
+      throw new Error(`Segment index ${segmentIndex} out of range`);
+    }
+
+    const previousHash = this.hash;
+    this.segmentIndex = segmentIndex;
+
+    // Slice this segment's bytes out of the full payload
+    const start = (segmentIndex - 1) * MAX_EFFICIENT_SIZE;
+    const end = Math.min(start + MAX_EFFICIENT_SIZE, this.fullData.length);
+    const segmentData = this.fullData.slice(start, end);
+    this.originalData = segmentData;
+
     // Random hash used for the outer resource hash + map_hash computation.
-    // Matches Python `self.random_hash` (separate from the inner data prefix).
+    // A fresh randomHash is generated for each segment.
     this.randomHash = randomBytes(RANDOM_HASH_SIZE);
 
-    // Resource hash = SHA256(original_data + random_hash). Computed on the
-    // PLAINTEXT original *uncompressed* data so the value is stable
-    // regardless of whether we end up sending compressed bytes on the wire.
-    // Matches Python RNS/Resource.py:438.
-    this.hash = sha256Hash(concat(data, this.randomHash));
+    // Resource hash = SHA256(segment_data + random_hash). Segment 1's
+    // hash becomes the stable originalHash used to identify the whole
+    // multi-segment transfer. Matches Python RNS/Resource.py:438.
+    this.hash = sha256Hash(concat(segmentData, this.randomHash));
+    this.expectedProof = sha256Hash(concat(segmentData, this.hash));
 
-    // Expected proof = SHA256(original_data + resource_hash). Also plaintext.
-    this.expectedProof = sha256Hash(concat(data, this.hash));
+    if (segmentIndex === 1) {
+      this.originalHash = this.hash;
+    } else if (previousHash && this._onSegmentAdvance) {
+      // Notify Link to re-key its outgoing resources map with the new
+      // per-segment hash so RESOURCE_REQ / RESOURCE_PRF lookups continue
+      // to find this sender.
+      try { this._onSegmentAdvance(previousHash, this.hash); } catch {}
+    }
 
-    // --- Compression decision ---
-    // Try bz2 compression if enabled, the payload is within the limit, and
-    // an encoder is registered (see src/utils/compress.js). We accept the
-    // compressed form only if it's strictly smaller than the original.
-    // Matches Python RNS/Resource.py:386-415.
-    this.uncompressedSize = data.length;
+    // Compression decision on this segment's data (Python compresses each
+    // segment independently — see RNS/Resource.py:387).
+    this.uncompressedSize = segmentData.length;
     this.compressed = false;
-    let payloadBytes = data;
-    if (this.autoCompress && data.length <= this.autoCompressLimit) {
-      const compressed = compressBz2(data);
-      if (compressed && compressed.length < data.length) {
+    let payloadBytes = segmentData;
+    if (this.autoCompress && segmentData.length <= this.autoCompressLimit) {
+      const compressed = compressBz2(segmentData);
+      if (compressed && compressed.length < segmentData.length) {
         payloadBytes = compressed;
         this.compressed = true;
       }
@@ -179,39 +249,28 @@ export class ResourceSender {
     this.compressedSize = payloadBytes.length;
 
     // Inner random-hash prefix that goes inside the encrypted stream. The
-    // receiver strips this after decryption (Python uses a different random
-    // value for the prefix vs the outer hash; we match by generating a fresh
-    // one here).
+    // receiver strips this after decryption.
     const innerPrefix = randomBytes(RANDOM_HASH_SIZE);
     this.transferData = concat(innerPrefix, payloadBytes);
 
-    // Derive SDU from link MTU (matching Python: link.mtu - 36)
-    this.sdu = (link.mtu || MTU) - SDU_OVERHEAD;
-
-    // Parts and hashmap are populated lazily in advertise() because we need
-    // an async link.encrypt() call when encryption is enabled.
+    // Reset per-segment transfer state
     this.totalParts = 0;
     this.parts = [];
     this.mapHashes = [];
     this.hashmapRaw = new Uint8Array(0);
-    this.streamData = null; // either plaintext or encrypted stream
+    this.streamData = null;
     this._prepared = false;
-
     this.sentParts = 0;
     this.lastPartSent = 0;
-    this.progress = 0;
-    this._onComplete = null;
-    this._onProgress = null;
-    this._onFailed = null;
+    this.status = RESOURCE_NONE;
 
-    // Watchdog / retry tracking — mirrors Python RNS/Resource.py:339-347
+    // Reset watchdog state for the new segment
     this.retriesLeft = MAX_ADV_RETRIES;
-    this.advSent = 0;                // time.time() in seconds when adv was last sent
+    this.advSent = 0;
     this.lastActivity = 0;
-    this.rtt = null;                 // set on first part request, from (now - advSent)
+    this.rtt = null;
     this.timeoutFactor = TRAFFIC_TIMEOUT_FACTOR;
-    this.timeout = 0;                // adv watchdog timeout window
-    this._watchdogTimer = null;
+    this.timeout = 0;
   }
 
   /**
@@ -406,16 +465,17 @@ export class ResourceSender {
     let flags = 0;
     if (this.encryptedFlag) flags |= FLAG_ENCRYPTED;
     if (this.compressed) flags |= FLAG_COMPRESSED;
+    if (this.split) flags |= FLAG_SPLIT;
 
     const adv = {
       t: this.streamData.length,         // on-wire transfer size (post-encryption)
-      d: this.originalData.length,        // logical (plaintext, uncompressed) data size
+      d: this.originalData.length,        // logical (plaintext, uncompressed) data size for this segment
       n: this.totalParts,
       h: this.hash,
       r: this.randomHash,
-      o: this.hash,
-      i: 1,
-      l: 1,
+      o: this.originalHash,               // stable identifier (segment 1's hash)
+      i: this.segmentIndex,
+      l: this.totalSegments,
       q: this.requestId,
       f: flags,
       m: hashmap,
@@ -594,7 +654,26 @@ export class ResourceSender {
     this.status = RESOURCE_COMPLETE;
     this.progress = 1;
     this._stopWatchdog();
-    log(LOG_INFO, TAG, `Resource transfer complete (verified by receiver)`);
+
+    // If this was an intermediate segment of a split transfer, load the
+    // next segment and re-advertise. The onComplete callback only fires
+    // after the FINAL segment is proved. Matches Python
+    // RNS/Resource.py:776-798 (validate_proof → prepare_next_segment).
+    if (this.split && this.segmentIndex < this.totalSegments) {
+      log(LOG_INFO, TAG,
+        `Segment ${this.segmentIndex}/${this.totalSegments} proved, advertising next`);
+      const nextIdx = this.segmentIndex + 1;
+      this._loadSegment(nextIdx);
+      // Fire-and-forget advertise — returns a Promise we don't await.
+      this.advertise().catch((err) => {
+        log(LOG_WARNING, TAG, `Next segment advertise failed: ${err.message}`);
+        if (this._onFailed) this._onFailed(err);
+      });
+      return true;
+    }
+
+    log(LOG_INFO, TAG,
+      `Resource transfer complete (${this.totalSegments} segment${this.totalSegments === 1 ? '' : 's'})`);
     if (this._onComplete) this._onComplete();
     return true;
   }
@@ -602,6 +681,7 @@ export class ResourceSender {
   onProgress(fn) { this._onProgress = fn; return this; }
   onComplete(fn) { this._onComplete = fn; return this; }
   onFailed(fn) { this._onFailed = fn; return this; }
+  onSegmentAdvance(fn) { this._onSegmentAdvance = fn; return this; }
 }
 
 /**

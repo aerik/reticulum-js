@@ -3,7 +3,7 @@ import {
   ResourceSender, ResourceReceiver,
   RESOURCE_NONE, RESOURCE_ADVERTISED, RESOURCE_TRANSFERRING,
   RESOURCE_AWAITING_PROOF, RESOURCE_COMPLETE, RESOURCE_FAILED, RESOURCE_REJECTED,
-  AUTO_COMPRESS_MAX_SIZE,
+  AUTO_COMPRESS_MAX_SIZE, MAX_EFFICIENT_SIZE,
 } from '../src/Resource.js';
 import { setCompressor, hasCompressor } from '../src/utils/compress.js';
 import { Link, LINK_ACTIVE } from '../src/Link.js';
@@ -713,6 +713,146 @@ describe('Resource', () => {
 
     it('AUTO_COMPRESS_MAX_SIZE matches Python default', () => {
       expect(AUTO_COMPRESS_MAX_SIZE).toBe(64 * 1024 * 1024);
+    });
+  });
+
+  describe('multi-segment sending', () => {
+    it('MAX_EFFICIENT_SIZE matches Python default', () => {
+      expect(MAX_EFFICIENT_SIZE).toBe(1024 * 1024 - 1);
+    });
+
+    it('single-segment for small data (<= MAX_EFFICIENT_SIZE)', async () => {
+      const { initiatorLink } = await setupLinkedPair();
+      const data = randomBytes(1000);
+      const sender = new ResourceSender(initiatorLink, data);
+      expect(sender.totalSegments).toBe(1);
+      expect(sender.split).toBe(false);
+      expect(sender.segmentIndex).toBe(1);
+      expect(sender.originalHash).toBeInstanceOf(Uint8Array);
+    });
+
+    it('splits into multiple segments for large data', async () => {
+      const { initiatorLink } = await setupLinkedPair();
+      // Use 2.5 MiB so we get exactly 3 segments (1 MiB - 1 each)
+      const data = new Uint8Array(MAX_EFFICIENT_SIZE * 2 + 100);
+      const sender = new ResourceSender(initiatorLink, data);
+      expect(sender.totalSegments).toBe(3);
+      expect(sender.split).toBe(true);
+      expect(sender.segmentIndex).toBe(1);
+    });
+
+    it('segment 1 loads only first MAX_EFFICIENT_SIZE bytes', async () => {
+      const { initiatorLink } = await setupLinkedPair();
+      const data = new Uint8Array(MAX_EFFICIENT_SIZE * 2);
+      for (let i = 0; i < data.length; i++) data[i] = i & 0xff;
+      const sender = new ResourceSender(initiatorLink, data);
+      expect(sender.originalData.length).toBe(MAX_EFFICIENT_SIZE);
+      // Spot-check first, middle, and last byte of segment 1
+      expect(sender.originalData[0]).toBe(0);
+      expect(sender.originalData[Math.floor(MAX_EFFICIENT_SIZE / 2)]).toBe(
+        Math.floor(MAX_EFFICIENT_SIZE / 2) & 0xff
+      );
+      expect(sender.originalData[MAX_EFFICIENT_SIZE - 1]).toBe((MAX_EFFICIENT_SIZE - 1) & 0xff);
+    });
+
+    it('originalHash is stable across segments', async () => {
+      const { initiatorLink } = await setupLinkedPair();
+      const data = new Uint8Array(MAX_EFFICIENT_SIZE * 2 + 50);
+      const sender = new ResourceSender(initiatorLink, data);
+      const initialOriginalHash = new Uint8Array(sender.originalHash);
+      const segment1Hash = new Uint8Array(sender.hash);
+
+      // Advance to segment 2 — hash changes but originalHash stays
+      sender._loadSegment(2);
+      expect(equal(sender.originalHash, initialOriginalHash)).toBe(true);
+      expect(equal(sender.hash, segment1Hash)).toBe(false);
+      expect(sender.segmentIndex).toBe(2);
+    });
+
+    it('_loadSegment loads correct slice for each segment', async () => {
+      const { initiatorLink } = await setupLinkedPair();
+      const SEGMENT = MAX_EFFICIENT_SIZE;
+      const total = SEGMENT * 2 + 100;
+      const data = new Uint8Array(total);
+      // Use segment index as byte value so each segment has unique content
+      for (let i = 0; i < total; i++) data[i] = Math.floor(i / SEGMENT);
+      const sender = new ResourceSender(initiatorLink, data);
+
+      expect(sender.originalData[0]).toBe(0);      // segment 1 starts at byte 0
+
+      sender._loadSegment(2);
+      expect(sender.originalData.length).toBe(SEGMENT);
+      expect(sender.originalData[0]).toBe(1);      // segment 2 byte 0 = "1"
+
+      sender._loadSegment(3);
+      expect(sender.originalData.length).toBe(100); // remainder
+      expect(sender.originalData[0]).toBe(2);      // segment 3 byte 0 = "2"
+    });
+
+    it('segment advertisement carries FLAG_SPLIT and correct i/l/o', async () => {
+      const { initiatorLink } = await setupLinkedPair();
+      const data = new Uint8Array(MAX_EFFICIENT_SIZE * 2 + 100);
+      const sender = new ResourceSender(initiatorLink, data, { encrypted: false });
+      await sender._prepareParts();
+      const packed = sender._packAdvertisement();
+      const { decode: msgpackDecode } = await import('@msgpack/msgpack');
+      const adv = msgpackDecode(packed);
+      expect((adv.f & 0x04) !== 0).toBe(true); // FLAG_SPLIT
+      expect(adv.i).toBe(1);
+      expect(adv.l).toBe(3);
+      // `o` (originalHash) equals `h` (per-segment hash) for segment 1
+      expect(equal(new Uint8Array(adv.o), new Uint8Array(adv.h))).toBe(true);
+    });
+
+    it('segment 2 advertisement has i=2 and same originalHash', async () => {
+      const { initiatorLink } = await setupLinkedPair();
+      const data = new Uint8Array(MAX_EFFICIENT_SIZE * 2 + 100);
+      const sender = new ResourceSender(initiatorLink, data, { encrypted: false });
+
+      const seg1OriginalHash = new Uint8Array(sender.originalHash);
+
+      // Advance to segment 2
+      sender._loadSegment(2);
+      await sender._prepareParts();
+      const packed = sender._packAdvertisement();
+      const { decode: msgpackDecode } = await import('@msgpack/msgpack');
+      const adv = msgpackDecode(packed);
+      expect(adv.i).toBe(2);
+      expect(adv.l).toBe(3);
+      // originalHash unchanged
+      expect(equal(new Uint8Array(adv.o), seg1OriginalHash)).toBe(true);
+      // But per-segment hash is different
+      expect(equal(new Uint8Array(adv.h), seg1OriginalHash)).toBe(false);
+    });
+
+    it('onSegmentAdvance callback fires on segment change', async () => {
+      const { initiatorLink } = await setupLinkedPair();
+      const data = new Uint8Array(MAX_EFFICIENT_SIZE * 2 + 100);
+      const sender = new ResourceSender(initiatorLink, data);
+
+      const advances = [];
+      sender.onSegmentAdvance((oldHash, newHash) => {
+        advances.push({ oldHash: new Uint8Array(oldHash), newHash: new Uint8Array(newHash) });
+      });
+
+      const hashBeforeSeg2 = new Uint8Array(sender.hash);
+      sender._loadSegment(2);
+      expect(advances).toHaveLength(1);
+      expect(equal(advances[0].oldHash, hashBeforeSeg2)).toBe(true);
+      expect(equal(advances[0].newHash, sender.hash)).toBe(true);
+
+      const hashBeforeSeg3 = new Uint8Array(sender.hash);
+      sender._loadSegment(3);
+      expect(advances).toHaveLength(2);
+      expect(equal(advances[1].oldHash, hashBeforeSeg3)).toBe(true);
+    });
+
+    it('throws on out-of-range segment index', async () => {
+      const { initiatorLink } = await setupLinkedPair();
+      const data = new Uint8Array(MAX_EFFICIENT_SIZE * 2);
+      const sender = new ResourceSender(initiatorLink, data);
+      expect(() => sender._loadSegment(0)).toThrow();
+      expect(() => sender._loadSegment(5)).toThrow();
     });
   });
 });
