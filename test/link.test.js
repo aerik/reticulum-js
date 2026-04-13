@@ -472,4 +472,218 @@ describe('Link', () => {
       expect(receipt.getStatus()).toBe(REQUEST_FAILED);
     });
   });
+
+  describe('watchdog STALE state machine', () => {
+    it('transitions to STALE after silence exceeds staleTime', async () => {
+      const { initiatorLink } = await setupLinkedPairWired();
+      // Collapse thresholds so the test runs fast
+      initiatorLink.keepalive = 0.1;   // 100ms
+      initiatorLink.staleTime = 0.2;   // 200ms
+
+      // Force the link to appear silent by rewinding lastInbound far into the past
+      initiatorLink.lastInbound = Date.now() - 1000;
+
+      let staleEmitted = false;
+      initiatorLink.on('stale', () => { staleEmitted = true; });
+
+      initiatorLink._watchdogCheck();
+      expect(initiatorLink.status).toBe(0x03); // LINK_STALE
+      expect(staleEmitted).toBe(true);
+    });
+
+    it('recovers from STALE when fresh inbound arrives', async () => {
+      const { initiatorLink } = await setupLinkedPairWired();
+      initiatorLink.keepalive = 0.1;
+      initiatorLink.staleTime = 0.2;
+
+      // Force into STALE
+      initiatorLink.lastInbound = Date.now() - 1000;
+      initiatorLink._watchdogCheck();
+      expect(initiatorLink.status).toBe(0x03); // STALE
+
+      // Simulate a packet arriving (resets lastInbound)
+      initiatorLink.lastInbound = Date.now();
+      initiatorLink._watchdogCheck();
+      expect(initiatorLink.status).toBe(LINK_ACTIVE);
+    });
+
+    it('_teardown(TIMEOUT) moves link to CLOSED and emits closed', async () => {
+      const { initiatorLink } = await setupLinkedPairWired();
+      let reason = null;
+      initiatorLink.on('closed', (r) => { reason = r; });
+      // STALE_GRACE is hardcoded to 5s so we can't cheaply wait out the real
+      // stale timeout. Verify the teardown path directly instead.
+      initiatorLink._teardown(0x01 /* TIMEOUT */);
+      expect(initiatorLink.status).toBe(LINK_CLOSED);
+      expect(reason).not.toBeNull();
+    });
+
+    it('initiator sends keepalive after keepalive period', async () => {
+      const { initiatorLink, initiatorTransport } = await setupLinkedPairWired();
+      initiatorLink.keepalive = 0.1;
+      initiatorLink.staleTime = 10; // avoid STALE
+
+      // Force the initiator's keepalive threshold to fire
+      initiatorLink.lastInbound = Date.now() - 500;
+      initiatorLink._lastKeepalive = 0;
+
+      // Capture the transmit to verify a keepalive packet was sent
+      const sent = [];
+      const origTransmit = initiatorTransport.transmit.bind(initiatorTransport);
+      initiatorTransport.transmit = (pkt) => {
+        sent.push(pkt);
+        return origTransmit(pkt);
+      };
+
+      initiatorLink._watchdogCheck();
+
+      const keepalives = sent.filter((p) => p.context === CONTEXT_KEEPALIVE);
+      expect(keepalives.length).toBeGreaterThan(0);
+    });
+
+    it('_watchdogCheck is a no-op when link is closed', async () => {
+      const { initiatorLink } = await setupLinkedPairWired();
+      await initiatorLink.close();
+      expect(initiatorLink.status).toBe(LINK_CLOSED);
+      // Should return without throwing and not change state
+      expect(() => initiatorLink._watchdogCheck()).not.toThrow();
+      expect(initiatorLink.status).toBe(LINK_CLOSED);
+    });
+  });
+
+  describe('sendWithProof', () => {
+    it('rejects on timeout when no proof arrives', async () => {
+      const { initiatorLink } = await setupLinkedPair();
+      // Use a standalone initiator (responder won't echo proofs for arbitrary packets)
+      await expect(
+        initiatorLink.sendWithProof(fromUtf8('hello'), 200)
+      ).rejects.toThrow(/timeout/i);
+    });
+
+    it('rejects when link is not active', async () => {
+      const { initiatorLink } = await setupLinkedPair();
+      await initiatorLink.close();
+      await expect(
+        initiatorLink.sendWithProof(fromUtf8('hello'), 1000)
+      ).rejects.toThrow(/not active/i);
+    });
+
+    it('pending proofs are rejected on link teardown', async () => {
+      const { initiatorLink } = await setupLinkedPair();
+      const p = initiatorLink.sendWithProof(fromUtf8('hello'), 60_000);
+      // Close the link mid-flight
+      await new Promise(r => setImmediate(r));
+      await initiatorLink.close();
+      await expect(p).rejects.toThrow(/closed/i);
+    });
+  });
+
+  describe('_handlePacketProof error paths', () => {
+    it('ignores short proof packets', async () => {
+      const { initiatorLink } = await setupLinkedPair();
+      const shortPkt = { data: new Uint8Array(10), context: CONTEXT_NONE };
+      // Should not throw or crash
+      expect(() => initiatorLink._handlePacketProof(shortPkt)).not.toThrow();
+    });
+
+    it('ignores proof for unknown packet hash', async () => {
+      const { initiatorLink } = await setupLinkedPair();
+      const pkt = { data: randomBytes(96), context: CONTEXT_NONE };
+      expect(() => initiatorLink._handlePacketProof(pkt)).not.toThrow();
+    });
+
+    it('rejects pending proof on invalid signature', async () => {
+      const { initiatorLink } = await setupLinkedPair();
+      const hashHex = toHex(randomBytes(32));
+      let rejected = null;
+      initiatorLink._pendingProofs.set(hashHex, {
+        resolve: () => {},
+        reject: (err) => { rejected = err; },
+      });
+
+      // Build a proof packet with the matching packet hash but a random signature
+      const packetHash = new Uint8Array(Buffer.from(hashHex, 'hex'));
+      const fakeSig = randomBytes(64);
+      const pkt = {
+        data: new Uint8Array([...packetHash, ...fakeSig]),
+        context: CONTEXT_NONE,
+      };
+      initiatorLink._handlePacketProof(pkt);
+      expect(rejected).not.toBeNull();
+      expect(rejected.message).toMatch(/signature/i);
+    });
+  });
+
+  describe('close()', () => {
+    it('sets status to CLOSED and emits the event', async () => {
+      const { initiatorLink } = await setupLinkedPair();
+      let reason = null;
+      initiatorLink.on('closed', (r) => { reason = r; });
+      await initiatorLink.close();
+      expect(initiatorLink.status).toBe(LINK_CLOSED);
+      expect(reason).not.toBeNull();
+    });
+
+    it('is idempotent', async () => {
+      const { initiatorLink } = await setupLinkedPair();
+      await initiatorLink.close();
+      expect(initiatorLink.status).toBe(LINK_CLOSED);
+      // A second close should not throw
+      await expect(initiatorLink.close()).resolves.not.toThrow();
+    });
+
+    it('zeroes session keys', async () => {
+      const { initiatorLink } = await setupLinkedPair();
+      expect(initiatorLink._encryptionKey).not.toBeNull();
+      await initiatorLink.close();
+      expect(initiatorLink._encryptionKey).toBeNull();
+      expect(initiatorLink._signingKey).toBeNull();
+      expect(initiatorLink._derivedKey).toBeNull();
+    });
+  });
+
+  describe('_handleLinkIdentify validation', () => {
+    it('rejects wrong-size plaintext silently', async () => {
+      const { responderLink } = await setupLinkedPair();
+      // Too short
+      expect(() => responderLink._handleLinkIdentify(new Uint8Array(50))).not.toThrow();
+      expect(responderLink._remoteIdentity).toBeNull();
+      // Too long
+      expect(() => responderLink._handleLinkIdentify(new Uint8Array(200))).not.toThrow();
+      expect(responderLink._remoteIdentity).toBeNull();
+    });
+
+    it('rejects invalid signature', async () => {
+      const { responderLink } = await setupLinkedPair();
+      // Build a plaintext with a valid-looking public key but a random signature
+      const id = Identity.generate();
+      const fakeProof = new Uint8Array([...id.publicKey, ...randomBytes(64)]);
+      responderLink._handleLinkIdentify(fakeProof);
+      expect(responderLink._remoteIdentity).toBeNull();
+    });
+
+    it('initiator side silently ignores LINKIDENTIFY', async () => {
+      const { initiatorLink } = await setupLinkedPair();
+      const id = Identity.generate();
+      const signedData = new Uint8Array([...initiatorLink.linkId, ...id.publicKey]);
+      const signature = id.sign(signedData);
+      const proof = new Uint8Array([...id.publicKey, ...signature]);
+      initiatorLink._handleLinkIdentify(proof);
+      expect(initiatorLink._remoteIdentity).toBeNull(); // never sets on initiator
+    });
+  });
+
+  describe('setResourceStrategy validation', () => {
+    it('accepts ACCEPT_NONE / ACCEPT_APP / ACCEPT_ALL', async () => {
+      const { initiatorLink } = await setupLinkedPair();
+      expect(() => initiatorLink.setResourceStrategy(ACCEPT_NONE)).not.toThrow();
+      expect(() => initiatorLink.setResourceStrategy(ACCEPT_APP)).not.toThrow();
+      expect(() => initiatorLink.setResourceStrategy(ACCEPT_ALL)).not.toThrow();
+    });
+
+    it('throws on invalid strategy', async () => {
+      const { initiatorLink } = await setupLinkedPair();
+      expect(() => initiatorLink.setResourceStrategy(0xFF)).toThrow(/unsupported/i);
+    });
+  });
 });

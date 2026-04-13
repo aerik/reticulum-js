@@ -26,6 +26,7 @@
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
     "test:interop": "vitest run --config vitest.interop.config.js",
     "serve": "node examples/serve.js",
     "build:browser": "vite build --config vite.browser.config.js",
@@ -57,6 +58,7 @@
     "ws": "^8.20.0"
   },
   "devDependencies": {
+    "@vitest/coverage-v8": "^4.1.4",
     "vitest": "^4.1.2"
   }
 }

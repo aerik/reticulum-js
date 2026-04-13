@@ -237,5 +237,176 @@ describe('LXMF peer sync', () => {
       expect(peerB.unhandledMessageCount).toBe(0);
       expect(routerB.propagationEntries.has(tidHex)).toBe(true);
     }, 30000);
+
+    it('syncs multiple messages to a peer in a single sync() call', async () => {
+      const { routerA, routerB } = makeWiredPair();
+
+      const announceA = createAnnounce(routerA.propagationDestination, new Uint8Array(msgpackEncode([
+        false, Math.floor(Date.now() / 1000), true, 256, 10240, [0, 0, 0], {},
+      ])));
+      const announceB = createAnnounce(routerB.propagationDestination, new Uint8Array(msgpackEncode([
+        false, Math.floor(Date.now() / 1000), true, 256, 10240, [0, 0, 0], {},
+      ])));
+      routerA.transport._handleAnnounce(announceB);
+      routerB.transport._handleAnnounce(announceA);
+
+      // Store 5 messages on A
+      const { sha256Hash } = await import('../src/utils/crypto.js');
+      const STAMP_SIZE = 32;
+      const tidHexes = [];
+      for (let i = 0; i < 5; i++) {
+        const data = new Uint8Array(200);
+        for (let j = 0; j < 200; j++) data[j] = (i + j) & 0xff;
+        const transientId = sha256Hash(data.slice(0, -STAMP_SIZE));
+        const tidHex = toHex(transientId);
+        tidHexes.push(tidHex);
+        routerA.propagationEntries.set(tidHex, {
+          destinationHash: randomBytes(16),
+          data,
+          received: Date.now() / 1000,
+          size: data.length,
+          stampValue: 0,
+          handledPeers: new Set(),
+          unhandledPeers: new Set(),
+        });
+        routerA.enqueuePeerDistribution(tidHex, null);
+      }
+      routerA.flushPeerDistributionQueue();
+
+      const peerB = routerA.peers.get(toHex(routerB.propagationDestination.hash));
+      expect(peerB.unhandledMessageCount).toBe(5);
+
+      await peerB.sync();
+
+      // All 5 messages should now be handled on A's peer entry for B
+      expect(peerB.handledMessageCount).toBe(5);
+      expect(peerB.unhandledMessageCount).toBe(0);
+
+      // And all 5 should appear in B's propagation store
+      for (const tidHex of tidHexes) {
+        expect(routerB.propagationEntries.has(tidHex)).toBe(true);
+      }
+    }, 30000);
+
+    it('peer responds with false when it already has the offered messages', async () => {
+      const { routerA, routerB } = makeWiredPair();
+
+      const announceA = createAnnounce(routerA.propagationDestination, new Uint8Array(msgpackEncode([
+        false, Math.floor(Date.now() / 1000), true, 256, 10240, [0, 0, 0], {},
+      ])));
+      const announceB = createAnnounce(routerB.propagationDestination, new Uint8Array(msgpackEncode([
+        false, Math.floor(Date.now() / 1000), true, 256, 10240, [0, 0, 0], {},
+      ])));
+      routerA.transport._handleAnnounce(announceB);
+      routerB.transport._handleAnnounce(announceA);
+
+      // Both A and B already have the same message stored
+      const { sha256Hash } = await import('../src/utils/crypto.js');
+      const STAMP_SIZE = 32;
+      const data = new Uint8Array(200);
+      for (let i = 0; i < 200; i++) data[i] = i & 0xff;
+      const transientId = sha256Hash(data.slice(0, -STAMP_SIZE));
+      const tidHex = toHex(transientId);
+      const entry = {
+        destinationHash: randomBytes(16),
+        data, received: Date.now() / 1000, size: data.length, stampValue: 0,
+        handledPeers: new Set(), unhandledPeers: new Set(),
+      };
+      routerA.propagationEntries.set(tidHex, entry);
+      routerB.propagationEntries.set(tidHex, { ...entry, handledPeers: new Set(), unhandledPeers: new Set() });
+
+      const peerB = routerA.peers.get(toHex(routerB.propagationDestination.hash));
+      peerB.addUnhandledMessage(tidHex);
+
+      const syncResult = await peerB.sync();
+      expect(syncResult).toBe(true);
+
+      // B responded false; A should mark the message handled anyway
+      expect(peerB.handledMessageCount).toBe(1);
+      expect(peerB.unhandledMessageCount).toBe(0);
+      // A's transfer stats show offered but no outgoing (nothing was sent)
+      expect(peerB.offered).toBeGreaterThan(0);
+      expect(peerB.outgoing).toBe(0);
+    }, 30000);
+
+    it('rotation drops low-acceptance peer when capacity reached', async () => {
+      const { routerA } = makeWiredPair();
+      routerA.maxPeers = 3;
+
+      // Add 3 peers, two high-AR and one low-AR
+      const good1 = randomBytes(16);
+      const good2 = randomBytes(16);
+      const bad = randomBytes(16);
+      for (const h of [good1, good2, bad]) {
+        routerA.peer(h, 1000, 256, null, 0, 0, 0, {});
+      }
+      const p1 = routerA.peers.get(toHex(good1));
+      const p2 = routerA.peers.get(toHex(good2));
+      const pBad = routerA.peers.get(toHex(bad));
+      p1.offered = 10; p1.outgoing = 10; p1.lastSyncAttempt = 1;
+      p2.offered = 10; p2.outgoing = 9;  p2.lastSyncAttempt = 1;
+      pBad.offered = 10; pBad.outgoing = 1; pBad.lastSyncAttempt = 1;
+
+      // Try to add a 4th peer — should trigger rotation, drop the bad one
+      const fresh = randomBytes(16);
+      routerA.peer(fresh, 2000, 256, null, 0, 0, 0, {});
+
+      expect(routerA.peers.has(toHex(good1))).toBe(true);
+      expect(routerA.peers.has(toHex(good2))).toBe(true);
+      expect(routerA.peers.has(toHex(bad))).toBe(false);
+      expect(routerA.peers.has(toHex(fresh))).toBe(true);
+      expect(routerA.peers.size).toBe(3);
+    });
+
+    it('syncPeers runs end-to-end cleanup + selection + sync', async () => {
+      const { routerA, routerB } = makeWiredPair();
+
+      const announceA = createAnnounce(routerA.propagationDestination, new Uint8Array(msgpackEncode([
+        false, Math.floor(Date.now() / 1000), true, 256, 10240, [0, 0, 0], {},
+      ])));
+      const announceB = createAnnounce(routerB.propagationDestination, new Uint8Array(msgpackEncode([
+        false, Math.floor(Date.now() / 1000), true, 256, 10240, [0, 0, 0], {},
+      ])));
+      routerA.transport._handleAnnounce(announceB);
+      routerB.transport._handleAnnounce(announceA);
+
+      // Stash a message that needs distributing
+      const { sha256Hash } = await import('../src/utils/crypto.js');
+      const STAMP_SIZE = 32;
+      const data = new Uint8Array(300);
+      for (let i = 0; i < 300; i++) data[i] = i & 0xff;
+      const tidHex = toHex(sha256Hash(data.slice(0, -STAMP_SIZE)));
+      routerA.propagationEntries.set(tidHex, {
+        destinationHash: randomBytes(16),
+        data, received: Date.now() / 1000, size: data.length, stampValue: 0,
+        handledPeers: new Set(), unhandledPeers: new Set(),
+      });
+      routerA.enqueuePeerDistribution(tidHex, null);
+
+      // Drive the full loop: distribution flush → rotation → sync
+      routerA.flushPeerDistributionQueue();
+      const selected = routerA.syncPeers();
+      expect(selected).not.toBeNull();
+
+      // Give the async sync() a chance to run to completion
+      await new Promise(r => setTimeout(r, 200));
+
+      expect(routerB.propagationEntries.has(tidHex)).toBe(true);
+    }, 30000);
+
+    it('unreachable peer is culled from syncPeers', async () => {
+      const { routerA } = makeWiredPair();
+
+      // Add a peer that's been silent for > PEER_MAX_UNREACHABLE
+      const deadHash = randomBytes(16);
+      routerA.peer(deadHash, 1000, 256, null, 0, 0, 0, {});
+      const p = routerA.peers.get(toHex(deadHash));
+      p.lastHeard = 0; // epoch
+      p.unhandledPeers = new Set(); // no pending work so it doesn't compete for sync
+
+      expect(routerA.peers.size).toBe(1);
+      routerA.syncPeers();
+      expect(routerA.peers.has(toHex(deadHash))).toBe(false);
+    });
   });
 });
