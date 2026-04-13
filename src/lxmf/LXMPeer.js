@@ -588,6 +588,22 @@ export class LXMPeer {
         this.removeUnhandledMessage(tidHex);
       }
 
+      // Persist the updated entries and the peer itself so a restart
+      // doesn't re-send messages we've already synced.
+      if (this.router.storage) {
+        if (typeof this.router.storage.savePropagationEntry === 'function') {
+          for (const tidHex of wantedIds) {
+            const entry = this.router.propagationEntries.get(tidHex);
+            if (entry) {
+              this.router.storage.savePropagationEntry(tidHex, entry).catch(() => {});
+            }
+          }
+        }
+        if (typeof this.router._persistPeer === 'function') {
+          this.router._persistPeer(this);
+        }
+      }
+
       const durationSec = (Date.now() - transferStart) / 1000;
       if (durationSec > 0) {
         this.syncTransferRate = (resourceData.length * 8) / durationSec;

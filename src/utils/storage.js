@@ -432,6 +432,123 @@ export class Storage {
     if (removed > 0) log(LOG_DEBUG, TAG, `Removed ${removed} expired remote ratchets`);
   }
 
+  // --- LXMF propagation message store ---
+  //
+  // Each stored message gets its own key under `storage/propagation/messages/`.
+  // Matches Python LXMF/LXMRouter.py which writes one file per message to
+  // `messagestore/<hex>_<received>_<stampvalue>`. We use key-based storage
+  // rather than filenames, so metadata (received, stampValue) is inside the
+  // serialised entry instead of encoded in the key.
+
+  _propMsgKey(tidHex) {
+    return `storage/propagation/messages/${tidHex}`;
+  }
+
+  /**
+   * Persist a propagation message entry. Sets (handledPeers /
+   * unhandledPeers) are flattened to hex-string arrays for msgpack.
+   * @param {string} tidHex - Transient ID as hex
+   * @param {object} entry
+   */
+  async savePropagationEntry(tidHex, entry) {
+    const record = {
+      destinationHash: entry.destinationHash ? Array.from(entry.destinationHash) : null,
+      data: entry.data ? Array.from(entry.data) : null,
+      received: entry.received,
+      size: entry.size,
+      stampValue: entry.stampValue || 0,
+      handledPeers: entry.handledPeers ? [...entry.handledPeers] : [],
+      unhandledPeers: entry.unhandledPeers ? [...entry.unhandledPeers] : [],
+    };
+    const packed = new Uint8Array(msgpackEncode(record));
+    await this.backend.set(this._propMsgKey(tidHex), packed);
+  }
+
+  /**
+   * Load all persisted propagation entries. Returns a Map keyed by tidHex.
+   * @returns {Promise<Map<string, object>>}
+   */
+  async loadPropagationEntries() {
+    const result = new Map();
+    const prefix = 'storage/propagation/messages/';
+    let keys;
+    try { keys = await this.backend.list(prefix); }
+    catch (err) {
+      log(LOG_WARNING, TAG, `Failed to list propagation entries: ${err.message}`);
+      return result;
+    }
+    for (const key of keys) {
+      try {
+        const data = await this.backend.get(key);
+        if (!data) continue;
+        const record = msgpackDecode(data);
+        if (!record) continue;
+        const tidHex = key.slice(prefix.length);
+        result.set(tidHex, {
+          destinationHash: record.destinationHash ? new Uint8Array(record.destinationHash) : null,
+          data: record.data ? new Uint8Array(record.data) : null,
+          received: record.received,
+          size: record.size,
+          stampValue: record.stampValue || 0,
+          handledPeers: new Set(record.handledPeers || []),
+          unhandledPeers: new Set(record.unhandledPeers || []),
+        });
+      } catch (err) {
+        log(LOG_WARNING, TAG, `Failed to parse propagation entry ${key}: ${err.message}`);
+      }
+    }
+    if (result.size > 0) log(LOG_DEBUG, TAG, `Loaded ${result.size} propagation entries`);
+    return result;
+  }
+
+  async deletePropagationEntry(tidHex) {
+    try { await this.backend.delete(this._propMsgKey(tidHex)); }
+    catch { /* best-effort */ }
+  }
+
+  // --- LXMF peer state ---
+
+  _peerKey(destHex) {
+    return `storage/propagation/peers/${destHex}`;
+  }
+
+  /**
+   * Persist a peer using its `toBytes()` serialization. The caller provides
+   * the pre-serialised bytes so this method stays independent of the
+   * LXMPeer class.
+   * @param {string} destHex
+   * @param {Uint8Array} bytes
+   */
+  async savePeer(destHex, bytes) {
+    await this.backend.set(this._peerKey(destHex), bytes);
+  }
+
+  /**
+   * Load all persisted peers as raw byte blobs. The LXMRouter should
+   * deserialize each via LXMPeer.fromBytes().
+   * @returns {Promise<Map<string, Uint8Array>>}
+   */
+  async loadPeers() {
+    const result = new Map();
+    const prefix = 'storage/propagation/peers/';
+    let keys;
+    try { keys = await this.backend.list(prefix); }
+    catch (err) { return result; }
+    for (const key of keys) {
+      try {
+        const data = await this.backend.get(key);
+        if (data) result.set(key.slice(prefix.length), data);
+      } catch { /* skip */ }
+    }
+    if (result.size > 0) log(LOG_DEBUG, TAG, `Loaded ${result.size} persisted peers`);
+    return result;
+  }
+
+  async deletePeer(destHex) {
+    try { await this.backend.delete(this._peerKey(destHex)); }
+    catch { /* best-effort */ }
+  }
+
   // --- Packet Hashlist ---
 
   async saveHashlist(hashlist) {

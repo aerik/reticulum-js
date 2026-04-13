@@ -51,7 +51,7 @@ load or against adversarial peers.
 | `Link.js` ↔ `RNS/Link.py` | ~90% | Handshake, encryption, watchdog, STALE/TIMEOUT, RCL/ICL/PRF dispatch, and resource_strategy (ACCEPT_NONE/APP/ALL) all correct. Missing: `RequestReceipt` API, MDU calc, mode negotiation, Channel, physical stats, `identify()`. |
 | `Resource.js` ↔ `RNS/Resource.py` | ~85% | Advertisement/parts/HMU/proof, watchdog/retry loop, and AWAITING_PROOF state all match. Still missing: adaptive window tuning (EIFR-based), multi-segment, auto-compression, metadata, input_file streaming. Status enum now matches Python numbering except REJECTED. |
 | `Transport.js` ↔ `RNS/Transport.py` | ~70% | Announce validation/forwarding, path table, dedup, link proof routing, and random_blob replay detection all work. Missing: path state machine, tunnel mode, control destinations (blackhole/instance/network/probe), shared instance, `await_path`. Gateway/boundary/AP modes are intentional edge-only divergence. |
-| `lxmf/LXMRouter.js` ↔ `LXMF/LXMRouter.py` | ~70% | Delivery flows, basic propagation storage, and the full peering subsystem (LXMPeer, peer()/unpeer(), auto-peering from announces, /offer handler, distribution queue, outbound sync state machine, syncPeers) all work — verified with a wired end-to-end integration test. Still missing: message store persistence (in-memory only), stamping/tickets, access control, peer rotation by acceptance rate, throttle tracking, control destination handlers. |
+| `lxmf/LXMRouter.js` ↔ `LXMF/LXMRouter.py` | ~75% | Delivery flows, peering subsystem (LXMPeer, peer()/unpeer(), auto-peering, /offer, distribution queue, outbound sync state machine, syncPeers), and storage-backed persistence for propagation entries + peers all work — verified end-to-end. Still missing: stamping/tickets, access control, peer rotation by acceptance rate, throttle tracking, control destination handlers. |
 | `lxmf/LXMessage.js` ↔ `LXMF/LXMessage.py` | ~90% | Wire format byte-exact. Pack/unpack/signature/hash all match. Missing only: `RENDERER_BBCODE` constant, accessor helpers (`title_as_string` etc.), paper format (`as_uri`/`as_qr`), delivery system integration (intentionally in LXMRouter). |
 
 **Interface layer** (`src/interfaces/*`): not audited. Known scope: JS has
@@ -200,17 +200,28 @@ a message, and the other receives it via a full sync round-trip
 - No stamp_cost filtering on the sender (assumes stamp_cost=0).
 - Fastest-N random pool reduced to first-by-transfer-rate selection.
 
-### 6. LXMF propagation message store is in-memory only  *(data-loss)*
+### 6. ~~LXMF propagation message store is in-memory only~~ — FIXED
 
-**Impact**: JS propagation store lives in Maps. Process restart = every
-propagated message gone. Python uses `messagestore/` directory with filename
-encoding for timestamp + stamp value, atomic replace on write.
+`Storage` gained `savePropagationEntry` / `loadPropagationEntries` /
+`deletePropagationEntry` and `savePeer` / `loadPeers` / `deletePeer`.
+Each propagation entry is persisted under
+`storage/propagation/messages/<tidHex>` as a msgpack record with the
+destination hash, data blob, received timestamp, size, stamp value,
+and the `handledPeers` / `unhandledPeers` hex sets (so sync state
+survives restart). Each peer is persisted under
+`storage/propagation/peers/<destHex>` via `LXMPeer.toBytes()`.
 
-**Files**: `src/lxmf/LXMRouter.js:enablePropagation()` and friends.
+`LXMRouter.enablePropagation()` became async and loads both entries
+and peers from storage on startup. Persistence is wired into
+`_lxmfPropagation` (store path), `_pruneOldestMessages`,
+`expireMessages`, `_messageGetRequest` (client purge), `peer()` /
+`unpeer()`, and post-sync state updates in `LXMPeer.sync()` so the
+in-memory state and on-disk state stay consistent.
 
-**Fix shape**: add a storage-backed propagation store with the same
-filename/scoring convention as Python, so a node can be restarted without
-losing queued messages.
+Verified with 10 new tests covering Storage round-trips for entries
+and peers, full router restart with messages + peers intact, prune
+deletes from disk, `unpeer()` deletes the peer record, and round-trip
+of peer relationships (handled/unhandled sets) across restart.
 
 ### 7. ~~Resource: no AWAITING_PROOF state~~ — FIXED
 

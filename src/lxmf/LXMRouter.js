@@ -1124,7 +1124,7 @@ export class LXMRouter extends EventEmitter {
    * @param {object} [options]
    * @param {number} [options.storageLimit] - Max messages to store
    */
-  enablePropagation(identity, options = {}) {
+  async enablePropagation(identity, options = {}) {
     this.propagationNode = true;
     this.propagationIdentity = identity;
     this.storageLimit = options.storageLimit || 50000;
@@ -1146,6 +1146,31 @@ export class LXMRouter extends EventEmitter {
     if (!this._propagationAnnounceHandlerAttached) {
       this.transport.on('announce', (info) => this._handlePropagationAnnounce(info));
       this._propagationAnnounceHandlerAttached = true;
+    }
+
+    // Load persisted propagation entries and peers from storage. Matches
+    // Python LXMRouter which reads messagestore/ and peers on startup.
+    if (this.storage && typeof this.storage.loadPropagationEntries === 'function') {
+      try {
+        const entries = await this.storage.loadPropagationEntries();
+        for (const [tidHex, entry] of entries) {
+          this.propagationEntries.set(tidHex, entry);
+        }
+        if (entries.size > 0) {
+          log(LOG_INFO, TAG, `Loaded ${entries.size} propagation entries from storage`);
+        }
+
+        const peerBlobs = await this.storage.loadPeers();
+        for (const [destHex, bytes] of peerBlobs) {
+          const peer = LXMPeer.fromBytes(this, bytes);
+          if (peer) this.peers.set(destHex, peer);
+        }
+        if (peerBlobs.size > 0) {
+          log(LOG_INFO, TAG, `Loaded ${this.peers.size} peers from storage`);
+        }
+      } catch (err) {
+        log(LOG_WARNING, TAG, `Failed to load propagation state: ${err.message}`);
+      }
     }
 
     log(LOG_INFO, TAG, `Propagation node enabled: ${toHex(this.propagationDestination.hash)}`);
@@ -1261,6 +1286,7 @@ export class LXMRouter extends EventEmitter {
         existing.propagationSyncLimit = propagationSyncLimit != null
           ? propagationSyncLimit : propagationTransferLimit;
         log(LOG_DEBUG, TAG, `Peering config updated for ${hexHash.slice(0,16)}..`);
+        this._persistPeer(existing);
       }
       return;
     }
@@ -1284,7 +1310,24 @@ export class LXMRouter extends EventEmitter {
       ? propagationSyncLimit : propagationTransferLimit;
     this.peers.set(hexHash, peer);
     log(LOG_INFO, TAG, `Peered with ${hexHash.slice(0,16)}..`);
+    this._persistPeer(peer);
     this.emit('peerAdded', peer);
+  }
+
+  /**
+   * Persist a peer's serialised state to storage. Best-effort —
+   * failures are logged but don't block the caller.
+   */
+  _persistPeer(peer) {
+    if (!this.storage || typeof this.storage.savePeer !== 'function') return;
+    try {
+      const bytes = peer.toBytes();
+      this.storage.savePeer(peer.destinationHashHex, bytes).catch((err) => {
+        log(LOG_WARNING, TAG, `Failed to persist peer: ${err.message}`);
+      });
+    } catch (err) {
+      log(LOG_WARNING, TAG, `Failed to serialize peer: ${err.message}`);
+    }
   }
 
   /**
@@ -1301,6 +1344,9 @@ export class LXMRouter extends EventEmitter {
     if (!peer) return false;
     if (timestamp >= peer.peeringTimebase) {
       this.peers.delete(hexHash);
+      if (this.storage && typeof this.storage.deletePeer === 'function') {
+        this.storage.deletePeer(hexHash).catch(() => {});
+      }
       log(LOG_INFO, TAG, `Broke peering with ${hexHash.slice(0,16)}..`);
       this.emit('peerRemoved', peer);
       return true;
@@ -1470,13 +1516,26 @@ export class LXMRouter extends EventEmitter {
     if (this.peerDistributionQueue.length === 0) return;
 
     const entries = this.peerDistributionQueue.splice(0);
+    const touchedTids = new Set();
     for (const [peerHex, peer] of this.peers) {
       for (const { transientIdHex, fromPeerHex } of entries) {
         if (peerHex !== fromPeerHex) {
           peer.queueUnhandledMessage(transientIdHex);
+          touchedTids.add(transientIdHex);
         }
       }
       peer.processQueues();
+    }
+
+    // Re-persist any propagation entries whose handled/unhandled sets
+    // changed so a restart recovers the correct sync state.
+    if (this.storage && typeof this.storage.savePropagationEntry === 'function') {
+      for (const tidHex of touchedTids) {
+        const entry = this.propagationEntries.get(tidHex);
+        if (entry) {
+          this.storage.savePropagationEntry(tidHex, entry).catch(() => {});
+        }
+      }
     }
   }
 
@@ -1514,6 +1573,9 @@ export class LXMRouter extends EventEmitter {
           const tidHex = toHex(tid);
           if (this.propagationEntries.has(tidHex)) {
             this.propagationEntries.delete(tidHex);
+            if (this.storage && typeof this.storage.deletePropagationEntry === 'function') {
+              this.storage.deletePropagationEntry(tidHex).catch(() => {});
+            }
             log(LOG_DEBUG, TAG, `Purged message ${tidHex.slice(0, 16)}..`);
           }
         }
@@ -1623,7 +1685,7 @@ export class LXMRouter extends EventEmitter {
 
     // Store for propagation (if we're a propagation node)
     if (this.propagationNode) {
-      this.propagationEntries.set(tidHex, {
+      const entry = {
         destinationHash,
         data: lxmfData,
         received,
@@ -1631,7 +1693,15 @@ export class LXMRouter extends EventEmitter {
         stampValue: 0,
         handledPeers: new Set(),
         unhandledPeers: new Set(),
-      });
+      };
+      this.propagationEntries.set(tidHex, entry);
+
+      // Persist to storage (best-effort, fire-and-forget)
+      if (this.storage && typeof this.storage.savePropagationEntry === 'function') {
+        this.storage.savePropagationEntry(tidHex, entry).catch((err) => {
+          log(LOG_WARNING, TAG, `Failed to persist propagation entry: ${err.message}`);
+        });
+      }
 
       // Enforce storage limit
       if (this.propagationEntries.size > this.storageLimit) {
@@ -1659,7 +1729,11 @@ export class LXMRouter extends EventEmitter {
 
     const toRemove = entries.length - this.storageLimit;
     for (let i = 0; i < toRemove; i++) {
-      this.propagationEntries.delete(entries[i][0]);
+      const tidHex = entries[i][0];
+      this.propagationEntries.delete(tidHex);
+      if (this.storage && typeof this.storage.deletePropagationEntry === 'function') {
+        this.storage.deletePropagationEntry(tidHex).catch(() => {});
+      }
     }
     log(LOG_INFO, TAG, `Pruned ${toRemove} oldest propagation messages`);
   }
@@ -1674,6 +1748,9 @@ export class LXMRouter extends EventEmitter {
     for (const [tid, entry] of this.propagationEntries) {
       if (now - entry.received > expiry) {
         this.propagationEntries.delete(tid);
+        if (this.storage && typeof this.storage.deletePropagationEntry === 'function') {
+          this.storage.deletePropagationEntry(tid).catch(() => {});
+        }
       }
     }
 
