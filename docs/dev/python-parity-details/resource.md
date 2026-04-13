@@ -41,7 +41,7 @@ not re-reported here.
 | Symbol | Status |
 |--------|--------|
 | MAX_EFFICIENT_SIZE | MISSING (task #38) |
-| AUTO_COMPRESS_MAX_SIZE | MISSING (task #39) |
+| AUTO_COMPRESS_MAX_SIZE | MATCHED | 64 MiB; exported from Resource.js |
 
 ### Retry / timeout
 
@@ -99,7 +99,7 @@ not re-reported here.
 | hashmap_update_packet / handleHashmapUpdate | MATCHED | |
 | get_map_hash / computeMapHash | MATCHED | SHA256(part + randomHash)[0:4] |
 | Encryption (full stream, not per-packet) | MATCHED | |
-| Compression (bz2) | MISSING (task #39) | |
+| Compression (bz2) | PARTIAL | Sender path fully wired: `autoCompress` option, size limit check, "only use compressed if smaller" decision, FLAG_COMPRESSED flag bit, hash computed on uncompressed data. A `compressBz2(data)` encoder must be registered via `setCompressor()` in src/utils/compress.js — no bz2 encoder bundled. Receiver-side decompression has always worked (seek-bzip vendored decoder). |
 | Metadata support | PARTIAL | FLAG unpacked, never used |
 | Multi-segment (split) | MISSING (task #38) | |
 | watchdog_job / threading | MATCHED | setInterval-based; same state-branch logic as Python's __watchdog_job |

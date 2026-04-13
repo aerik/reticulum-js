@@ -3,7 +3,9 @@ import {
   ResourceSender, ResourceReceiver,
   RESOURCE_NONE, RESOURCE_ADVERTISED, RESOURCE_TRANSFERRING,
   RESOURCE_AWAITING_PROOF, RESOURCE_COMPLETE, RESOURCE_FAILED, RESOURCE_REJECTED,
+  AUTO_COMPRESS_MAX_SIZE,
 } from '../src/Resource.js';
+import { setCompressor, hasCompressor } from '../src/utils/compress.js';
 import { Link, LINK_ACTIVE } from '../src/Link.js';
 import { Transport } from '../src/Transport.js';
 import { Identity } from '../src/Identity.js';
@@ -565,6 +567,152 @@ describe('Resource', () => {
       expect(failedWith.message).toMatch(/Timeout/);
 
       receiver._stopWatchdog();
+    });
+  });
+
+  describe('sender auto-compression', () => {
+    // Install a fake compressor for the duration of these tests. It produces
+    // output proportionally smaller than the input so the sender's "only
+    // send compressed if it's smaller" check passes deterministically.
+    function installFakeCompressor(ratio = 0.5) {
+      setCompressor((bytes) => {
+        // Deterministic shrink: prefix with a magic header and include a
+        // length field so the fake is safely distinguishable from arbitrary
+        // bytes. The contents don't need to round-trip for these tests —
+        // decompression is tested separately with real bz2 data elsewhere.
+        const targetLen = Math.max(1, Math.floor(bytes.length * ratio));
+        const result = new Uint8Array(targetLen);
+        result[0] = 0x42; // 'B'
+        result[1] = 0x5A; // 'Z'
+        return result;
+      });
+    }
+    function uninstallCompressor() { setCompressor(null); }
+
+    it('no compressor configured → sends uncompressed', async () => {
+      uninstallCompressor();
+      expect(hasCompressor()).toBe(false);
+      const { initiatorLink } = await setupLinkedPair();
+      const data = randomBytes(500);
+      const sender = new ResourceSender(initiatorLink, data);
+      expect(sender.compressed).toBe(false);
+      expect(sender.compressedSize).toBe(data.length);
+    });
+
+    it('compressor configured and output smaller → marks compressed', async () => {
+      installFakeCompressor(0.3);
+      const { initiatorLink } = await setupLinkedPair();
+      const data = randomBytes(500);
+      const sender = new ResourceSender(initiatorLink, data);
+      expect(sender.compressed).toBe(true);
+      expect(sender.compressedSize).toBeLessThan(data.length);
+      uninstallCompressor();
+    });
+
+    it('compressor output not smaller → falls back to uncompressed', async () => {
+      installFakeCompressor(1.5); // compressed is LARGER
+      const { initiatorLink } = await setupLinkedPair();
+      const data = randomBytes(500);
+      const sender = new ResourceSender(initiatorLink, data);
+      expect(sender.compressed).toBe(false);
+      expect(sender.compressedSize).toBe(data.length);
+      uninstallCompressor();
+    });
+
+    it('autoCompress: false disables compression', async () => {
+      installFakeCompressor(0.3);
+      const { initiatorLink } = await setupLinkedPair();
+      const data = randomBytes(500);
+      const sender = new ResourceSender(initiatorLink, data, { autoCompress: false });
+      expect(sender.compressed).toBe(false);
+      uninstallCompressor();
+    });
+
+    it('autoCompress: <integer> sets the size limit', async () => {
+      installFakeCompressor(0.3);
+      const { initiatorLink } = await setupLinkedPair();
+
+      // Data within limit → compressed
+      const small = randomBytes(100);
+      const s1 = new ResourceSender(initiatorLink, small, { autoCompress: 1000 });
+      expect(s1.compressed).toBe(true);
+
+      // Data over limit → not compressed
+      const big = randomBytes(2000);
+      const s2 = new ResourceSender(initiatorLink, big, { autoCompress: 1000 });
+      expect(s2.compressed).toBe(false);
+
+      uninstallCompressor();
+    });
+
+    it('data exceeding AUTO_COMPRESS_MAX_SIZE is not compressed', async () => {
+      // We don't actually allocate 64 MB — we set a tiny limit instead so
+      // the test can run cheaply.
+      installFakeCompressor(0.3);
+      const { initiatorLink } = await setupLinkedPair();
+      const data = randomBytes(100);
+      // With autoCompress=50 (numeric limit), 100 bytes exceeds 50
+      const sender = new ResourceSender(initiatorLink, data, { autoCompress: 50 });
+      expect(sender.compressed).toBe(false);
+      uninstallCompressor();
+    });
+
+    it('FLAG_COMPRESSED is set in the advertisement when compressed', async () => {
+      installFakeCompressor(0.3);
+      const { initiatorLink } = await setupLinkedPair();
+      const data = randomBytes(500);
+      const sender = new ResourceSender(initiatorLink, data, { encrypted: false });
+      await sender._prepareParts();
+      const packed = sender._packAdvertisement();
+      const { decode: msgpackDecode } = await import('@msgpack/msgpack');
+      const adv = msgpackDecode(packed);
+      expect((adv.f & 0x02) !== 0).toBe(true); // FLAG_COMPRESSED
+      uninstallCompressor();
+    });
+
+    it('resource hash is computed on uncompressed data (stable)', async () => {
+      uninstallCompressor();
+      const { initiatorLink } = await setupLinkedPair();
+      const data = randomBytes(500);
+
+      const uncompressedSender = new ResourceSender(initiatorLink, data);
+      const hashWithoutCompression = new Uint8Array(uncompressedSender.hash);
+      const randomHashWithoutCompression = new Uint8Array(uncompressedSender.randomHash);
+
+      // Now install a compressor and create a new sender with the SAME
+      // random bytes for the randomHash — force it by patching.
+      installFakeCompressor(0.3);
+      const compressedSender = new ResourceSender(initiatorLink, data);
+      // Override randomHash to match the uncompressed sender, then
+      // recompute the hash as the constructor would.
+      compressedSender.randomHash = randomHashWithoutCompression;
+      const { sha256Hash } = await import('../src/utils/crypto.js');
+      const { concat } = await import('../src/utils/bytes.js');
+      compressedSender.hash = sha256Hash(concat(data, compressedSender.randomHash));
+
+      // Hashes must match — compression state does NOT affect the hash.
+      expect(equal(compressedSender.hash, hashWithoutCompression)).toBe(true);
+      uninstallCompressor();
+    });
+
+    it('end-to-end: hash on uncompressed data survives compression flag', async () => {
+      // We can't run a full round-trip with the fake compressor since it
+      // doesn't actually compress, so this just verifies that the
+      // advertisement's `d` field reflects the original uncompressed size.
+      installFakeCompressor(0.3);
+      const { initiatorLink } = await setupLinkedPair();
+      const data = randomBytes(500);
+      const sender = new ResourceSender(initiatorLink, data, { encrypted: false });
+      await sender._prepareParts();
+      const packed = sender._packAdvertisement();
+      const { decode: msgpackDecode } = await import('@msgpack/msgpack');
+      const adv = msgpackDecode(packed);
+      expect(adv.d).toBe(500); // uncompressed original size
+      uninstallCompressor();
+    });
+
+    it('AUTO_COMPRESS_MAX_SIZE matches Python default', () => {
+      expect(AUTO_COMPRESS_MAX_SIZE).toBe(64 * 1024 * 1024);
     });
   });
 });

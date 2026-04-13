@@ -20,6 +20,7 @@ import { concat, toHex, randomBytes, equal } from './utils/bytes.js';
 import { Packet } from './Packet.js';
 import { log, LOG_DEBUG, LOG_INFO, LOG_WARNING } from './utils/log.js';
 import { decompressBz2 } from './utils/decompress.js';
+import { compressBz2 } from './utils/compress.js';
 import {
   PACKET_DATA, PACKET_PROOF,
   HEADER_1, DEST_LINK, TRANSPORT_BROADCAST,
@@ -85,6 +86,13 @@ const WATCHDOG_INTERVAL_MS = 1000; // Python's WATCHDOG_MAX_SLEEP = 1.0s
 // Link.TRAFFIC_TIMEOUT_FACTOR in Python RNS/Link.py:82.
 const TRAFFIC_TIMEOUT_FACTOR = 6;
 
+/**
+ * Maximum uncompressed data size to attempt auto-compression on.
+ * Matches Python RNS/Resource.py:124 AUTO_COMPRESS_MAX_SIZE = 64 MiB.
+ * Larger payloads skip compression to avoid excessive CPU.
+ */
+export const AUTO_COMPRESS_MAX_SIZE = 64 * 1024 * 1024;
+
 // Flags
 const FLAG_ENCRYPTED    = 0x01;
 const FLAG_COMPRESSED   = 0x02;
@@ -122,23 +130,60 @@ export class ResourceSender {
     this.encryptedFlag = options.encrypted !== false;
     this.status = RESOURCE_NONE;
 
+    // Auto-compression config — matches Python `auto_compress` param on
+    // RNS.Resource (RNS/Resource.py:246,362-371). Default is to try
+    // compression on payloads up to AUTO_COMPRESS_MAX_SIZE. A custom
+    // limit can be passed as either a boolean or an integer.
+    this.autoCompressOption = options.autoCompress !== undefined ? options.autoCompress : true;
+    let autoCompressLimit = AUTO_COMPRESS_MAX_SIZE;
+    let autoCompressEnabled = true;
+    if (typeof this.autoCompressOption === 'boolean') {
+      autoCompressEnabled = this.autoCompressOption;
+    } else if (typeof this.autoCompressOption === 'number') {
+      autoCompressEnabled = true;
+      autoCompressLimit = this.autoCompressOption;
+    } else {
+      throw new TypeError('Invalid type for autoCompress option');
+    }
+    this.autoCompressLimit = autoCompressLimit;
+    this.autoCompress = autoCompressEnabled;
+
     // Random hash used for the outer resource hash + map_hash computation.
     // Matches Python `self.random_hash` (separate from the inner data prefix).
     this.randomHash = randomBytes(RANDOM_HASH_SIZE);
 
     // Resource hash = SHA256(original_data + random_hash). Computed on the
-    // PLAINTEXT original data (matches Python's `full_hash(data+random_hash)`).
+    // PLAINTEXT original *uncompressed* data so the value is stable
+    // regardless of whether we end up sending compressed bytes on the wire.
+    // Matches Python RNS/Resource.py:438.
     this.hash = sha256Hash(concat(data, this.randomHash));
 
     // Expected proof = SHA256(original_data + resource_hash). Also plaintext.
     this.expectedProof = sha256Hash(concat(data, this.hash));
+
+    // --- Compression decision ---
+    // Try bz2 compression if enabled, the payload is within the limit, and
+    // an encoder is registered (see src/utils/compress.js). We accept the
+    // compressed form only if it's strictly smaller than the original.
+    // Matches Python RNS/Resource.py:386-415.
+    this.uncompressedSize = data.length;
+    this.compressed = false;
+    let payloadBytes = data;
+    if (this.autoCompress && data.length <= this.autoCompressLimit) {
+      const compressed = compressBz2(data);
+      if (compressed && compressed.length < data.length) {
+        payloadBytes = compressed;
+        this.compressed = true;
+      }
+    }
+    this.compressedSize = payloadBytes.length;
 
     // Inner random-hash prefix that goes inside the encrypted stream. The
     // receiver strips this after decryption (Python uses a different random
     // value for the prefix vs the outer hash; we match by generating a fresh
     // one here).
     const innerPrefix = randomBytes(RANDOM_HASH_SIZE);
-    this.transferData = concat(innerPrefix, data);
+    this.transferData = concat(innerPrefix, payloadBytes);
 
     // Derive SDU from link MTU (matching Python: link.mtu - 36)
     this.sdu = (link.mtu || MTU) - SDU_OVERHEAD;
@@ -358,11 +403,13 @@ export class ResourceSender {
     const initialMapCount = Math.min(this.totalParts, HASHMAP_MAX_LEN);
     const hashmap = this.hashmapRaw.slice(0, initialMapCount * MAPHASH_LEN);
 
-    const flags = this.encryptedFlag ? FLAG_ENCRYPTED : 0;
+    let flags = 0;
+    if (this.encryptedFlag) flags |= FLAG_ENCRYPTED;
+    if (this.compressed) flags |= FLAG_COMPRESSED;
 
     const adv = {
       t: this.streamData.length,         // on-wire transfer size (post-encryption)
-      d: this.originalData.length,        // logical (plaintext) data size
+      d: this.originalData.length,        // logical (plaintext, uncompressed) data size
       n: this.totalParts,
       h: this.hash,
       r: this.randomHash,
