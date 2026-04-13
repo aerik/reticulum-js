@@ -109,14 +109,18 @@ describe('Link request/response', () => {
     expect(new TextDecoder().decode(response)).toBe('pong');
   });
 
-  it('handles null response data', async () => {
+  it('handler returning null sends no response (matches Python)', async () => {
+    // Python's Link.handle_request (RNS/Link.py:889) only sends a
+    // RESPONSE packet when the handler returns non-None. A null response
+    // means "don't respond at all", which the initiator observes as a
+    // timeout.
     const { initiatorLink, responderLink } = await setupLinkedPairWithRouting();
 
     responderLink.registerRequestHandler('/void', async () => {
       return null;
     });
 
-    const response = await initiatorLink.request('/void', fromUtf8('data'), 5000);
+    const response = await initiatorLink.request('/void', fromUtf8('data'), 500);
     expect(response).toBeNull();
   });
 

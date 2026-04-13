@@ -34,6 +34,8 @@ import {
 import { concat, toHex, equal, randomBytes } from './utils/bytes.js';
 import { Packet } from './Packet.js';
 import { ResourceReceiver, ResourceSender, RESOURCE_COMPLETE, RESOURCE_FAILED } from './Resource.js';
+import { ALLOW_NONE, ALLOW_ALL, ALLOW_LIST } from './Destination.js';
+import { Identity } from './Identity.js';
 import { log, LOG_DEBUG, LOG_INFO, LOG_WARNING, LOG_VERBOSE } from './utils/log.js';
 import { encode as msgpackEncode, decode as msgpackDecode } from '@msgpack/msgpack';
 import {
@@ -42,7 +44,7 @@ import {
   DEST_SINGLE, DEST_LINK,
   FLAG_UNSET,
   CONTEXT_NONE, CONTEXT_LRPROOF, CONTEXT_LRRTT,
-  CONTEXT_KEEPALIVE, CONTEXT_LINKCLOSE, CONTEXT_LINKPROOF,
+  CONTEXT_KEEPALIVE, CONTEXT_LINKCLOSE, CONTEXT_LINKPROOF, CONTEXT_LINKIDENTIFY,
   CONTEXT_REQUEST, CONTEXT_RESPONSE,
   CONTEXT_RESOURCE_PRF, CONTEXT_RESOURCE_ICL, CONTEXT_RESOURCE_RCL,
   IDENTITY_HASH_LENGTH,
@@ -147,6 +149,12 @@ export class Link extends EventEmitter {
     this.resourceStrategy = ACCEPT_NONE;
     this._resourceCallback = null;          // callback(adv) → bool, for ACCEPT_APP
     this._resourceConcludedCallback = null; // callback(resource)
+
+    // Remote peer identity, set after the remote calls identify() on the
+    // link. Matches Python Link.__remote_identity. Used for ALLOW_LIST
+    // access control on request handlers.
+    this._remoteIdentity = null;
+    this._remoteIdentifiedCallback = null;
 
     // Keepalive / stale detection (matching Python RNS/Link.py watchdog)
     this._initiator = false;
@@ -557,22 +565,66 @@ export class Link extends EventEmitter {
       const [timestamp, pathHash, requestData] = unpacked;
       const pathHashHex = toHex(new Uint8Array(pathHash));
 
-      const handler = this._requestHandlers.get(pathHashHex);
-      if (!handler) {
-        log(LOG_DEBUG, TAG, `No handler for request path ${pathHashHex}`);
-        return;
-      }
-
       // request_id = packetHash[:16] — matches Python's getTruncatedHash()
       const requestId = packet.packetHash
         ? packet.packetHash.slice(0, IDENTITY_HASH_LENGTH)
         : truncatedHash(new Uint8Array(plaintext), IDENTITY_HASH_LENGTH);
 
-      // Call handler
-      const responseData = await handler(
-        requestData ? new Uint8Array(requestData) : null,
-        this
-      );
+      // Dispatch: check destination-level handlers first (Python-style with
+      // access policy), then fall back to link-level handlers (simpler
+      // JS-only API).
+      let responseData = null;
+      const destHandler = this.destination
+        ? this.destination.requestHandlers.get(pathHashHex) : null;
+
+      if (destHandler) {
+        // Access policy check — matches Python Link.handle_request at
+        // RNS/Link.py:862-892.
+        let allowed = false;
+        if (destHandler.allow === ALLOW_ALL) {
+          allowed = true;
+        } else if (destHandler.allow === ALLOW_LIST) {
+          if (this._remoteIdentity) {
+            for (const allowedHash of destHandler.allowedList) {
+              if (equal(this._remoteIdentity.hash, allowedHash)) {
+                allowed = true;
+                break;
+              }
+            }
+          }
+        }
+
+        if (!allowed) {
+          log(LOG_DEBUG, TAG,
+            `Request ${toHex(requestId).slice(0,16)}.. denied for path ${destHandler.path}`);
+          return;
+        }
+
+        log(LOG_DEBUG, TAG,
+          `Handling request ${toHex(requestId).slice(0,16)}.. for ${destHandler.path}`);
+
+        responseData = await destHandler.handler(
+          destHandler.path,
+          requestData ? new Uint8Array(requestData) : null,
+          requestId,
+          this._remoteIdentity,
+          timestamp
+        );
+      } else {
+        // Link-level fallback — kept for internal callers that register
+        // handlers directly on the link (e.g. LXMF /get and /offer).
+        const handler = this._requestHandlers.get(pathHashHex);
+        if (!handler) {
+          log(LOG_DEBUG, TAG, `No handler for request path ${pathHashHex}`);
+          return;
+        }
+        responseData = await handler(
+          requestData ? new Uint8Array(requestData) : null,
+          this
+        );
+      }
+
+      if (responseData == null) return;
 
       // Send response: msgpack([request_id, response_data])
       const responsePacked = msgpackEncode([requestId, responseData]);
@@ -748,6 +800,81 @@ export class Link extends EventEmitter {
     }
     log(LOG_INFO, TAG, `Outgoing resource ${hashHex.slice(0,16)}.. rejected by receiver`);
     entry.sender._rejected('Resource rejected by receiver (possibly exceeds delivery limit)');
+  }
+
+  /**
+   * Identify the initiator of the link to the remote peer. Sends a
+   * CONTEXT_LINKIDENTIFY packet containing the identity's public key and
+   * a signature over (linkId + publicKey). The receiving link validates
+   * the signature and sets its `_remoteIdentity` so access-controlled
+   * request handlers (ALLOW_LIST) can match against it.
+   *
+   * Matches Python `Link.identify()` in RNS/Link.py:459.
+   *
+   * @param {import('./Identity.js').Identity} identity
+   */
+  async identify(identity) {
+    if (!this._initiator) {
+      throw new Error('Only the initiator of a link can identify');
+    }
+    if (this.status !== LINK_ACTIVE) {
+      throw new Error('Link is not active');
+    }
+    if (!identity.hasPrivateKey()) {
+      throw new Error('Cannot identify with a public-only identity');
+    }
+
+    const publicKey = identity.publicKey; // 64 bytes (enc + sig)
+    const signedData = concat(this.linkId, publicKey);
+    const signature = identity.sign(signedData);
+    const proofData = concat(publicKey, signature);
+
+    await this.send(proofData, CONTEXT_LINKIDENTIFY);
+  }
+
+  /**
+   * Returns the remote peer's identity if they've called identify(),
+   * or null otherwise.
+   */
+  getRemoteIdentity() {
+    return this._remoteIdentity;
+  }
+
+  /**
+   * Register a callback for when the remote peer identifies itself.
+   * @param {function(Link, import('./Identity.js').Identity): void} fn
+   */
+  onRemoteIdentified(fn) {
+    this._remoteIdentifiedCallback = fn;
+  }
+
+  /**
+   * Handle an incoming CONTEXT_LINKIDENTIFY packet (responder side).
+   * Matches Python RNS/Link.py:1014-1032.
+   * @param {Uint8Array} plaintext - pubkey(64) + signature(64)
+   */
+  _handleLinkIdentify(plaintext) {
+    if (this._initiator) return; // initiator never receives identify
+    if (!plaintext || plaintext.length !== 128) {
+      log(LOG_DEBUG, TAG, `LINKIDENTIFY: wrong size ${plaintext ? plaintext.length : 0}`);
+      return;
+    }
+    const publicKey = plaintext.slice(0, 64);
+    const signature = plaintext.slice(64, 128);
+    const signedData = concat(this.linkId, publicKey);
+
+    const identity = Identity.fromPublicKey(publicKey);
+    if (!identity.verify(signedData, signature)) {
+      log(LOG_WARNING, TAG, `LINKIDENTIFY: signature verification failed`);
+      return;
+    }
+
+    this._remoteIdentity = identity;
+    log(LOG_DEBUG, TAG, `Link remote identified: ${identity.hexHash}`);
+    if (this._remoteIdentifiedCallback) {
+      try { this._remoteIdentifiedCallback(this, identity); }
+      catch (err) { log(LOG_WARNING, TAG, `remoteIdentified callback error: ${err.message}`); }
+    }
   }
 
   /**

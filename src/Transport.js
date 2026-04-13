@@ -30,7 +30,7 @@ import {
   DEST_SINGLE, DEST_PLAIN, DEST_GROUP, DEST_LINK,
   ADDR_SIZE, MAX_HOPS,
   CONTEXT_NONE,
-  CONTEXT_KEEPALIVE, CONTEXT_LRPROOF, CONTEXT_LRRTT, CONTEXT_LINKCLOSE,
+  CONTEXT_KEEPALIVE, CONTEXT_LRPROOF, CONTEXT_LRRTT, CONTEXT_LINKCLOSE, CONTEXT_LINKIDENTIFY,
   CONTEXT_REQUEST, CONTEXT_RESPONSE, CONTEXT_CHANNEL,
   CONTEXT_RESOURCE, CONTEXT_RESOURCE_ADV, CONTEXT_RESOURCE_REQ, CONTEXT_RESOURCE_HMU, CONTEXT_RESOURCE_PRF,
   CONTEXT_RESOURCE_ICL, CONTEXT_RESOURCE_RCL,
@@ -549,6 +549,15 @@ export class Transport extends EventEmitter {
       case CONTEXT_LINKCLOSE:
         link.handleClose(packet.data);
         break;
+      case CONTEXT_LINKIDENTIFY: {
+        try {
+          const plaintext = await link.decrypt(packet.data);
+          link._handleLinkIdentify(plaintext);
+        } catch (err) {
+          log(LOG_WARNING, TAG, `LinkIdentify decrypt failed: ${err.message}`);
+        }
+        break;
+      }
       case CONTEXT_REQUEST:
       case CONTEXT_RESPONSE: {
         try {

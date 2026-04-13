@@ -34,6 +34,11 @@ export const RATCHET_INTERVAL = 30 * 60;
  */
 export const RATCHET_COUNT = 512;
 
+// Request handler access policies — match Python RNS/Destination.py:74-77.
+export const ALLOW_NONE = 0x00;
+export const ALLOW_ALL  = 0x01;
+export const ALLOW_LIST = 0x02;
+
 export class Destination {
   /**
    * @param {import('./Identity.js').Identity|null} identity
@@ -85,6 +90,11 @@ export class Destination {
       link: null,
       proof: null,
     };
+
+    // Request handlers — matches Python Destination.request_handlers
+    // Map: pathHashHex → { path, handler, allow, allowedList }
+    this.requestHandlers = new Map();
+    this.acceptLinkRequests = true;
 
     // Ratchet state — mirrors Python Destination fields in RNS/Destination.py:161-168
     this.ratchets = null;                // List of 32-byte X25519 private keys (newest first), or null = disabled
@@ -259,6 +269,51 @@ export class Destination {
    */
   static computeHash(nameHash, identityHash) {
     return truncatedHash(concat(nameHash, identityHash), IDENTITY_HASH_LENGTH);
+  }
+
+  /**
+   * Register a request handler for a path on this destination. Matches
+   * Python `Destination.register_request_handler` in RNS/Destination.py:380.
+   *
+   * The handler is invoked with `(path, data, requestId, remoteIdentity,
+   * requestedAt)` when a link to this destination receives a REQUEST
+   * packet for the matching path. `allow` policy controls access:
+   *   ALLOW_NONE — reject (do not dispatch)
+   *   ALLOW_ALL  — always dispatch
+   *   ALLOW_LIST — only dispatch when the link's remoteIdentity hash is in
+   *                `allowedList`
+   *
+   * @param {string} path
+   * @param {function(string, Uint8Array|null, Uint8Array, import('./Identity.js').Identity|null, number): any} handler
+   * @param {object} [options]
+   * @param {number} [options.allow=ALLOW_NONE]
+   * @param {Uint8Array[]} [options.allowedList]
+   */
+  registerRequestHandler(path, handler, options = {}) {
+    if (!path) throw new Error('Invalid path');
+    if (typeof handler !== 'function') throw new Error('Invalid handler');
+    const allow = options.allow != null ? options.allow : ALLOW_NONE;
+    if (allow !== ALLOW_NONE && allow !== ALLOW_ALL && allow !== ALLOW_LIST) {
+      throw new Error('Invalid request policy');
+    }
+    const pathHash = truncatedHash(fromUtf8(path), IDENTITY_HASH_LENGTH);
+    this.requestHandlers.set(toHex(pathHash), {
+      path,
+      handler,
+      allow,
+      allowedList: options.allowedList || [],
+    });
+  }
+
+  /**
+   * Deregister a previously-registered request handler.
+   * Matches Python `Destination.deregister_request_handler`.
+   * @param {string} path
+   * @returns {boolean}
+   */
+  deregisterRequestHandler(path) {
+    const pathHash = truncatedHash(fromUtf8(path), IDENTITY_HASH_LENGTH);
+    return this.requestHandlers.delete(toHex(pathHash));
   }
 
   /**
