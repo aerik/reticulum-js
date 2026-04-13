@@ -47,11 +47,11 @@ load or against adversarial peers.
 |-----------|-------:|---------|
 | `Packet.js` ↔ `RNS/Packet.py` | ~85% | Wire format matches; `pack()` doesn't encrypt (callers do it); no `PacketReceipt`/`ProofDestination`; LRPROOF special-case not in Packet itself (Link handles it). |
 | `Identity.js` ↔ `RNS/Identity.py` | ~90% | Crypto primitives, multi-ratchet decrypt, and class-level known-ratchets store (remember/recall/clean + RATCHET_EXPIRY) all match Python. Announce validation lives in `Announce.js`, known-destinations in `Transport.announceTable`. |
-| `Destination.js` ↔ `RNS/Destination.py` | ~60% | Hash, callbacks, name expansion, and full ratchet management (rotation, persistence, enforce, retained count, interval) now match Python. `announce()` is in `src/Announce.js` (architectural split). Still missing: request handlers, `encrypt()`/`decrypt()` dispatch, `incoming_link_request()`, GROUP destination support. |
+| `Destination.js` ↔ `RNS/Destination.py` | ~75% | Hash, callbacks, name expansion, full ratchet management, and request handler dispatch with ALLOW_NONE/ALL/LIST access policies all match Python. `announce()` is in `src/Announce.js` (architectural split). Still missing: `encrypt()`/`decrypt()` dispatch, `incoming_link_request()`, GROUP destination support. |
 | `Link.js` ↔ `RNS/Link.py` | ~90% | Handshake, encryption, watchdog, STALE/TIMEOUT, RCL/ICL/PRF dispatch, and resource_strategy (ACCEPT_NONE/APP/ALL) all correct. Missing: `RequestReceipt` API, MDU calc, mode negotiation, Channel, physical stats, `identify()`. |
 | `Resource.js` ↔ `RNS/Resource.py` | ~85% | Advertisement/parts/HMU/proof, watchdog/retry loop, and AWAITING_PROOF state all match. Still missing: adaptive window tuning (EIFR-based), multi-segment, auto-compression, metadata, input_file streaming. Status enum now matches Python numbering except REJECTED. |
 | `Transport.js` ↔ `RNS/Transport.py` | ~70% | Announce validation/forwarding, path table, dedup, link proof routing, and random_blob replay detection all work. Missing: path state machine, tunnel mode, control destinations (blackhole/instance/network/probe), shared instance, `await_path`. Gateway/boundary/AP modes are intentional edge-only divergence. |
-| `lxmf/LXMRouter.js` ↔ `LXMF/LXMRouter.py` | ~75% | Delivery flows, peering subsystem (LXMPeer, peer()/unpeer(), auto-peering, /offer, distribution queue, outbound sync state machine, syncPeers), and storage-backed persistence for propagation entries + peers all work — verified end-to-end. Still missing: stamping/tickets, access control, peer rotation by acceptance rate, throttle tracking, control destination handlers. |
+| `lxmf/LXMRouter.js` ↔ `LXMF/LXMRouter.py` | ~85% | Delivery flows, full peering subsystem (LXMPeer, peer()/unpeer(), auto-peering, /offer, distribution queue, outbound sync, syncPeers, rotation, unreachable culling, throttling), storage-backed persistence, and admin control endpoints (/pn/get/stats, /pn/peer/sync, /pn/peer/unpeer) all work. Still missing: stamping/tickets, message allow/deny lists, trust-on-first-use peering from unknown sync senders. |
 | `lxmf/LXMessage.js` ↔ `LXMF/LXMessage.py` | ~90% | Wire format byte-exact. Pack/unpack/signature/hash all match. Missing only: `RENDERER_BBCODE` constant, accessor helpers (`title_as_string` etc.), paper format (`as_uri`/`as_qr`), delivery system integration (intentionally in LXMRouter). |
 
 **Interface layer** (`src/interfaces/*`): not audited. Known scope: JS has
@@ -186,13 +186,25 @@ two wired propagation nodes exchange announces, auto-peer, one stores
 a message, and the other receives it via a full sync round-trip
 (link → /offer → resource → proof).
 
-**Still deferred to Phase 5** (feature/ops work, not correctness):
-- Peer rotation by acceptance rate
-- Throttle tracking / `clean_throttled_peers`
-- Control-destination handlers (`/pn/get/stats`, `/pn/peer/sync`,
-  `/pn/peer/unpeer`)
-- Peer persistence to storage across restarts
-- Auto-peering from incoming sync from unknown peer
+**Phase 5 completed** (commit 38697ee + follow-up):
+- Peer rotation by acceptance rate (`rotatePeers()`) — matches Python
+  `LXMF/LXMRouter.py:1945` with headroom, ROTATION_AR_MAX threshold,
+  and static-peer protection
+- Unreachable peer culling wired into `syncPeers()` with
+  `PEER_MAX_UNREACHABLE` (14 days)
+- Throttle tracking (`throttledPeers` map, `cleanThrottledPeers()`) with
+  `ERROR_THROTTLED` returned from `_offerRequest` when the remote is in
+  cooldown
+- Control destination (`lxmf.propagation.control`) with Python-matching
+  handlers: `/pn/get/stats`, `/pn/peer/sync`, `/pn/peer/unpeer`, all
+  gated by `ALLOW_LIST` against `controlAllowedList` (defaults to the
+  node's own identity hash)
+- `compileStats()` returning a structured dict of peer stats and node
+  counters (uptime, message store size, client counters, peer breakdown)
+- Peer persistence across restart was landed earlier (commit 2e5e54e)
+
+**Still deferred** (minor, non-blocking):
+- Auto-peering from incoming sync from unknown peer (trust-on-first-use)
 
 **Simplifications vs Python**:
 - No `link.identify()` (JS Link lacks identify()), so identity-based

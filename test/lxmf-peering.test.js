@@ -440,9 +440,11 @@ describe('LXMRouter peering', () => {
     it('rejects a stamp from a different peering id', () => {
       const peeringIdA = randomBytes(32);
       const peeringIdB = randomBytes(32);
-      const { stamp } = generatePeeringKey(peeringIdA, 4);
-      // Same stamp validated against a different peering id should fail
-      expect(validatePeeringKey(peeringIdB, stamp, 4)).toBe(false);
+      const { stamp } = generatePeeringKey(peeringIdA, 8);
+      // Same stamp validated against a different peering id should fail.
+      // Use cost 8 (1/256 false-positive rate) to avoid flakiness from
+      // random stamps that happen to satisfy both workblocks.
+      expect(validatePeeringKey(peeringIdB, stamp, 8)).toBe(false);
     });
 
     it('rejects null or wrong-size stamps', () => {

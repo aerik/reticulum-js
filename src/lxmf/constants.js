@@ -63,13 +63,22 @@ export const ERROR_TIMEOUT      = 0xFE;
 export const STRATEGY_LAZY       = 0x01;
 export const STRATEGY_PERSISTENT = 0x02;
 
-// Peering defaults — match Python LXMF/LXMRouter.py
-export const MAX_PEERS            = 6;
-export const AUTOPEER             = true;
-export const AUTOPEER_MAXDEPTH    = 4;
-export const PEERING_COST         = 0;
-export const MAX_PEERING_COST     = 255;
+// Peering defaults — match Python LXMF/LXMRouter.py:40-60
+export const MAX_PEERS             = 20;
+export const AUTOPEER              = true;
+export const AUTOPEER_MAXDEPTH     = 4;
+export const PEERING_COST          = 0;
+export const MAX_PEERING_COST      = 255;
+export const ROTATION_HEADROOM_PCT = 10;    // % of max_peers reserved for new peers
+export const ROTATION_AR_MAX       = 0.5;   // drop peers with acceptance rate below this
+export const PN_STAMP_THROTTLE     = 180;   // seconds — throttle duration
+export const FASTEST_N_RANDOM_POOL = 8;     // top-N fastest peers for random selection
 export const DEFAULT_SYNC_STRATEGY = STRATEGY_PERSISTENT;
+
+// Control paths — match Python LXMF/LXMRouter.py:82-84
+export const STATS_GET_PATH       = '/pn/get/stats';
+export const SYNC_REQUEST_PATH    = '/pn/peer/sync';
+export const UNPEER_REQUEST_PATH  = '/pn/peer/unpeer';
 
 // LXMPeer timing — match Python LXMF/LXMPeer.py:37-50
 export const PEER_MAX_UNREACHABLE   = 14 * 24 * 60 * 60; // 14 days

@@ -15,7 +15,7 @@
  */
 
 import { EventEmitter } from '../utils/events.js';
-import { Destination } from '../Destination.js';
+import { Destination, ALLOW_LIST } from '../Destination.js';
 import { Identity } from '../Identity.js';
 import { Link, ACCEPT_APP, ACCEPT_ALL } from '../Link.js';
 import { Packet } from '../Packet.js';
@@ -27,8 +27,12 @@ import {
 import { LXMPeer } from './LXMPeer.js';
 import { validatePeeringKey } from './LXStamper.js';
 import { APP_NAME, MESSAGE_GET_PATH, OFFER_REQUEST_PATH, MESSAGE_EXPIRY,
+         STATS_GET_PATH, SYNC_REQUEST_PATH, UNPEER_REQUEST_PATH,
          ERROR_NO_IDENTITY, ERROR_NO_ACCESS, ERROR_INVALID_DATA, ERROR_INVALID_KEY,
-         PROPAGATION_LIMIT, DELIVERY_LIMIT, STRATEGY_PERSISTENT, PN_META_NAME } from './constants.js';
+         ERROR_NOT_FOUND, ERROR_THROTTLED,
+         PROPAGATION_LIMIT, DELIVERY_LIMIT, STRATEGY_PERSISTENT, PN_META_NAME,
+         MAX_PEERS, AUTOPEER_MAXDEPTH, ROTATION_HEADROOM_PCT, ROTATION_AR_MAX,
+         PN_STAMP_THROTTLE, PEER_MAX_UNREACHABLE, PEER_IDLE } from './constants.js';
 import { sha256Hash, truncatedHash } from '../utils/crypto.js';
 import { concat, toHex, equal, fromUtf8 } from '../utils/bytes.js';
 import { log, LOG_DEBUG, LOG_INFO, LOG_WARNING, LOG_ERROR } from '../utils/log.js';
@@ -90,9 +94,10 @@ export class LXMRouter extends EventEmitter {
 
     // Peering configuration — matches Python LXMRouter.py constructor
     this.autopeer = options.autopeer !== undefined ? options.autopeer : true;
-    this.autopeerMaxdepth = options.autopeerMaxdepth || 4;
-    this.maxPeers = options.maxPeers || 6;
+    this.autopeerMaxdepth = options.autopeerMaxdepth || AUTOPEER_MAXDEPTH;
+    this.maxPeers = options.maxPeers || MAX_PEERS;
     this.maxPeeringCost = options.maxPeeringCost != null ? options.maxPeeringCost : 255;
+    this.prioritiseRotatingUnreachablePeers = options.prioritiseRotatingUnreachablePeers !== false;
     this.defaultSyncStrategy = options.syncStrategy || STRATEGY_PERSISTENT;
     this.propagationPerTransferLimit = options.propagationTransferLimit || PROPAGATION_LIMIT;
     this.propagationPerSyncLimit = options.propagationSyncLimit || (PROPAGATION_LIMIT * 40);
@@ -101,9 +106,21 @@ export class LXMRouter extends EventEmitter {
     this.peeringCost = options.peeringCost || 0;
     this.nodeName = options.nodeName || null;
 
+    // Control access — list of Identity hash Uint8Arrays allowed to call
+    // the /pn/get/stats, /pn/peer/sync, /pn/peer/unpeer endpoints.
+    // Defaults to [identity.hash] when enablePropagation is called.
+    this.controlAllowedList = options.controlAllowedList || [];
+
     // Peering state — matches Python LXMRouter peers dict
     this.peers = new Map();              // destHashHex → LXMPeer
+    this.staticPeers = new Set();        // destHashHex values that won't be rotated/culled
     this.peerDistributionQueue = [];     // [{ transientIdHex, fromPeerHex }]
+    this.throttledPeers = new Map();     // destHashHex → expiry epoch seconds
+    this.propagationNodeStartTime = Date.now() / 1000;
+    this.clientPropagationMessagesReceived = 0;
+    this.clientPropagationMessagesServed = 0;
+    this.unpeeredPropagationIncoming = 0;
+    this.unpeeredPropagationRxBytes = 0;
 
     // Active links for delivery
     this._deliveryLinks = new Map(); // destHashHex → link
@@ -130,11 +147,14 @@ export class LXMRouter extends EventEmitter {
       }, 5000);
       if (this._outboundInterval.unref) this._outboundInterval.unref();
 
-      // Peer sync loop — drains the distribution queue then picks a peer
-      // to sync. Matches Python's sync_peers call cadence (~30s).
+      // Peer sync loop — drains the distribution queue, cleans throttled
+      // peers, runs rotation, then picks a peer to sync. Matches Python's
+      // sync_peers call cadence (~30s).
       this._syncInterval = setInterval(() => {
         try {
+          this.cleanThrottledPeers();
           this.flushPeerDistributionQueue();
+          this.rotatePeers();
           this.syncPeers();
         } catch (err) {
           log(LOG_WARNING, TAG, `Peer sync error: ${err.message}`);
@@ -1128,6 +1148,7 @@ export class LXMRouter extends EventEmitter {
     this.propagationNode = true;
     this.propagationIdentity = identity;
     this.storageLimit = options.storageLimit || 50000;
+    this.propagationNodeStartTime = Date.now() / 1000;
 
     // Create propagation destination
     this.propagationDestination = new Destination(
@@ -1140,6 +1161,33 @@ export class LXMRouter extends EventEmitter {
       this._propagationLinkEstablished(link);
       return true;
     });
+
+    // Create control destination for admin RPC (stats, peer sync, unpeer).
+    // Matches Python LXMRouter.py:653-657. Access defaults to the owner's
+    // own identity hash so only the owner can query or manipulate peers.
+    if (this.controlAllowedList.length === 0) {
+      this.controlAllowedList = [identity.hash];
+    }
+    this.controlDestination = new Destination(
+      identity, DEST_IN, DEST_SINGLE, APP_NAME, 'propagation', 'control'
+    );
+    this.transport.registerDestination(this.controlDestination);
+    this.controlDestination.setLinkCallback(() => true);
+    this.controlDestination.registerRequestHandler(
+      STATS_GET_PATH,
+      (path, data, requestId, remoteIdentity) => this._statsGetRequest(remoteIdentity),
+      { allow: ALLOW_LIST, allowedList: this.controlAllowedList }
+    );
+    this.controlDestination.registerRequestHandler(
+      SYNC_REQUEST_PATH,
+      (path, data, requestId, remoteIdentity) => this._peerSyncRequest(data, remoteIdentity),
+      { allow: ALLOW_LIST, allowedList: this.controlAllowedList }
+    );
+    this.controlDestination.registerRequestHandler(
+      UNPEER_REQUEST_PATH,
+      (path, data, requestId, remoteIdentity) => this._peerUnpeerRequest(data, remoteIdentity),
+      { allow: ALLOW_LIST, allowedList: this.controlAllowedList }
+    );
 
     // Subscribe to transport announces for auto-peering. We only peer with
     // other propagation nodes, identified by their app_data format.
@@ -1292,9 +1340,14 @@ export class LXMRouter extends EventEmitter {
     }
 
     if (this.peers.size >= this.maxPeers) {
-      log(LOG_DEBUG, TAG,
-        `Max peers reached (${this.maxPeers}), not peering with ${hexHash.slice(0,16)}..`);
-      return;
+      // Try to make room by rotating out low-acceptance peers before
+      // giving up on the new one.
+      this.rotatePeers();
+      if (this.peers.size >= this.maxPeers) {
+        log(LOG_DEBUG, TAG,
+          `Max peers reached (${this.maxPeers}), not peering with ${hexHash.slice(0,16)}..`);
+        return;
+      }
     }
 
     const peer = new LXMPeer(this, destinationHash, { syncStrategy: this.defaultSyncStrategy });
@@ -1422,6 +1475,24 @@ export class LXMRouter extends EventEmitter {
       return ERROR_INVALID_DATA;
     }
 
+    // Throttle check: if the peer is in the cooldown window, reject.
+    // Matches Python offer_request throttle guard at LXMF/LXMRouter.py:2147-2152.
+    const remoteIdentity = link && link._remoteIdentity;
+    if (remoteIdentity) {
+      const remoteDest = new Destination(remoteIdentity, 0x12, 0x00, APP_NAME, 'propagation');
+      const remoteHex = toHex(remoteDest.hash);
+      const throttleUntil = this.throttledPeers.get(remoteHex);
+      if (throttleUntil != null) {
+        const now = Date.now() / 1000;
+        if (throttleUntil > now) {
+          log(LOG_DEBUG, TAG, `Rejecting /offer from throttled peer ${remoteHex.slice(0,16)}..`);
+          return ERROR_THROTTLED;
+        } else {
+          this.throttledPeers.delete(remoteHex);
+        }
+      }
+    }
+
     const peeringKey = data[0] != null ? new Uint8Array(data[0]) : null;
     const transientIds = data[1];
     if (!Array.isArray(transientIds)) return ERROR_INVALID_DATA;
@@ -1487,12 +1558,29 @@ export class LXMRouter extends EventEmitter {
    *     maintenance step (Phase 5).
    */
   syncPeers() {
+    // First cull peers we haven't heard from in MAX_UNREACHABLE seconds.
+    // Matches Python sync_peers at LXMF/LXMRouter.py:2022-2075.
+    const now = Date.now() / 1000;
+    const culled = [];
     const waiting = [];
-    for (const peer of this.peers.values()) {
-      if (peer.state === 0 /* PEER_IDLE */ && peer.unhandledMessageCount > 0 && peer.alive) {
+    for (const [hex, peer] of this.peers) {
+      if (now > peer.lastHeard + PEER_MAX_UNREACHABLE) {
+        if (!this.staticPeers.has(hex)) culled.push(hex);
+      } else if (peer.state === PEER_IDLE && peer.unhandledMessageCount > 0 && peer.alive) {
         waiting.push(peer);
       }
     }
+
+    for (const hex of culled) {
+      log(LOG_WARNING, TAG, `Removing peer ${hex.slice(0,16)}.. due to excessive unreachability`);
+      const peer = this.peers.get(hex);
+      this.peers.delete(hex);
+      if (this.storage && typeof this.storage.deletePeer === 'function') {
+        this.storage.deletePeer(hex).catch(() => {});
+      }
+      if (peer) this.emit('peerRemoved', peer);
+    }
+
     if (waiting.length === 0) return null;
 
     // Sort by transfer rate descending (fastest first), falling back to
@@ -1505,6 +1593,216 @@ export class LXMRouter extends EventEmitter {
       log(LOG_WARNING, TAG, `Sync with ${selected.destinationHashHex.slice(0,16)}.. threw: ${err.message}`);
     });
     return selected;
+  }
+
+  /**
+   * Drop low-acceptance-rate peers to make room for new ones. Called when
+   * peer count approaches the configured maximum. Matches Python
+   * LXMF/LXMRouter.py:1945 rotate_peers().
+   *
+   * Strategy:
+   *   1. Reserve a headroom of max(1, floor(maxPeers * 10%)) slots for
+   *      newly-discovered peers.
+   *   2. If already too few untested peers, skip rotation entirely
+   *      (avoids churning when nothing is settled).
+   *   3. Prefer dropping peers that have at least one offer on record
+   *      (so we have an acceptance rate to judge).
+   *   4. Of those, drop the ones with the lowest acceptance rate, limited
+   *      to `required_drops` peers, and only if their rate is below
+   *      ROTATION_AR_MAX.
+   */
+  rotatePeers() {
+    try {
+      const headroom = Math.max(1, Math.floor(this.maxPeers * (ROTATION_HEADROOM_PCT / 100)));
+      const requiredDrops = this.peers.size - (this.maxPeers - headroom);
+      if (requiredDrops <= 0 || this.peers.size - requiredDrops <= 1) return;
+
+      // Count untested (no sync attempts yet) peers — bail if too many
+      // fresh peers are still being evaluated.
+      let untestedCount = 0;
+      for (const peer of this.peers.values()) {
+        if (peer.lastSyncAttempt === 0) untestedCount++;
+      }
+      if (untestedCount >= headroom) {
+        log(LOG_DEBUG, TAG, 'Newly added peer threshold reached, postponing rotation');
+        return;
+      }
+
+      // Prefer fully-synced peers as the rotation pool so in-progress
+      // peers aren't dropped mid-transfer.
+      let pool = [];
+      for (const [hex, peer] of this.peers) {
+        if (peer.unhandledMessageCount === 0) pool.push([hex, peer]);
+      }
+      if (pool.length === 0) pool = [...this.peers];
+
+      const waiting = [];
+      const unresponsive = [];
+      for (const [hex, peer] of pool) {
+        if (this.staticPeers.has(hex) || peer.state !== PEER_IDLE) continue;
+        if (peer.alive) {
+          if (peer.offered > 0) waiting.push(peer);
+        } else {
+          unresponsive.push(peer);
+        }
+      }
+
+      let dropPool = [];
+      if (unresponsive.length > 0) {
+        dropPool.push(...unresponsive);
+        if (!this.prioritiseRotatingUnreachablePeers) dropPool.push(...waiting);
+      } else {
+        dropPool = waiting;
+      }
+
+      if (dropPool.length === 0) return;
+
+      const dropCount = Math.min(requiredDrops, dropPool.length);
+      dropPool.sort((a, b) => {
+        const ar_a = a.offered === 0 ? 0 : a.outgoing / a.offered;
+        const ar_b = b.offered === 0 ? 0 : b.outgoing / b.offered;
+        return ar_a - ar_b;
+      });
+
+      let dropped = 0;
+      for (let i = 0; i < dropCount; i++) {
+        const peer = dropPool[i];
+        const ar = peer.offered === 0 ? 0 : peer.outgoing / peer.offered;
+        if (ar < ROTATION_AR_MAX) {
+          log(LOG_DEBUG, TAG,
+            `Acceptance rate for peer ${peer.destinationHashHex.slice(0,16)}.. ` +
+            `was ${(ar * 100).toFixed(1)}% (${peer.outgoing}/${peer.offered}), dropping`);
+          this.unpeer(peer.destinationHash);
+          dropped++;
+        }
+      }
+      if (dropped > 0) {
+        log(LOG_DEBUG, TAG, `Dropped ${dropped} low-acceptance peers to increase headroom`);
+      }
+    } catch (err) {
+      log(LOG_WARNING, TAG, `Error during peer rotation: ${err.message}`);
+    }
+  }
+
+  /**
+   * Remove expired entries from the throttled peers map. Called from the
+   * sync loop. Matches Python `clean_throttled_peers()`.
+   */
+  cleanThrottledPeers() {
+    const now = Date.now() / 1000;
+    for (const [hex, expiry] of this.throttledPeers) {
+      if (now > expiry) this.throttledPeers.delete(hex);
+    }
+  }
+
+  /**
+   * Compile a stats dict for the /pn/get/stats endpoint. Matches Python
+   * `compile_stats()` at LXMF/LXMRouter.py:750.
+   * @returns {object}
+   */
+  compileStats() {
+    if (!this.propagationNode) return null;
+
+    const peerStats = {};
+    for (const [hex, peer] of this.peers) {
+      peerStats[hex] = {
+        type: this.staticPeers.has(hex) ? 'static' : 'discovered',
+        state: peer.state,
+        alive: peer.alive,
+        name: peer.name,
+        lastHeard: Math.floor(peer.lastHeard || 0),
+        nextSyncAttempt: peer.nextSyncAttempt,
+        lastSyncAttempt: peer.lastSyncAttempt,
+        syncBackoff: peer.syncBackoff,
+        peeringTimebase: peer.peeringTimebase,
+        linkEstablishmentRate: Math.floor(peer.linkEstablishmentRate || 0),
+        syncTransferRate: Math.floor(peer.syncTransferRate || 0),
+        transferLimit: peer.propagationTransferLimit,
+        syncLimit: peer.propagationSyncLimit,
+        targetStampCost: peer.propagationStampCost,
+        stampCostFlexibility: peer.propagationStampCostFlexibility,
+        peeringCost: peer.peeringCost,
+        rxBytes: peer.rxBytes,
+        txBytes: peer.txBytes,
+        acceptanceRate: peer.acceptanceRate,
+        messages: {
+          offered: peer.offered,
+          outgoing: peer.outgoing,
+          incoming: peer.incoming,
+          unhandled: peer.unhandledMessageCount,
+        },
+      };
+    }
+
+    let messageStoreBytes = 0;
+    for (const entry of this.propagationEntries.values()) {
+      messageStoreBytes += entry.size || 0;
+    }
+
+    return {
+      identityHash: this.propagationIdentity ? this.propagationIdentity.hash : null,
+      destinationHash: this.propagationDestination ? this.propagationDestination.hash : null,
+      uptime: (Date.now() / 1000) - this.propagationNodeStartTime,
+      deliveryLimit: this.deliveryPerTransferLimit,
+      propagationLimit: this.propagationPerTransferLimit,
+      syncLimit: this.propagationPerSyncLimit,
+      targetStampCost: this.propagationStampCost,
+      stampCostFlexibility: this.propagationStampCostFlexibility,
+      peeringCost: this.peeringCost,
+      maxPeeringCost: this.maxPeeringCost,
+      autopeerMaxdepth: this.autopeerMaxdepth,
+      messagestore: {
+        count: this.propagationEntries.size,
+        bytes: messageStoreBytes,
+        limit: this.storageLimit,
+      },
+      clients: {
+        clientPropagationMessagesReceived: this.clientPropagationMessagesReceived,
+        clientPropagationMessagesServed: this.clientPropagationMessagesServed,
+      },
+      unpeeredPropagationIncoming: this.unpeeredPropagationIncoming,
+      unpeeredPropagationRxBytes: this.unpeeredPropagationRxBytes,
+      staticPeers: this.staticPeers.size,
+      discoveredPeers: this.peers.size - this.staticPeers.size,
+      totalPeers: this.peers.size,
+      maxPeers: this.maxPeers,
+      peers: peerStats,
+    };
+  }
+
+  // --- Control endpoint handlers ---
+  //
+  // All three enforce the ALLOW_LIST policy via Destination request
+  // handler dispatch; by the time we're called, `remoteIdentity` is
+  // already verified to be in `controlAllowedList`. We still return the
+  // Python-compatible error codes on bad input so remote admin tools can
+  // display them.
+
+  _statsGetRequest(remoteIdentity) {
+    if (!remoteIdentity) return ERROR_NO_IDENTITY;
+    return this.compileStats();
+  }
+
+  _peerSyncRequest(data, remoteIdentity) {
+    if (!remoteIdentity) return ERROR_NO_IDENTITY;
+    if (!data || data.length !== 16) return ERROR_INVALID_DATA;
+    const hex = toHex(new Uint8Array(data));
+    const peer = this.peers.get(hex);
+    if (!peer) return ERROR_NOT_FOUND;
+    peer.sync().catch((err) => {
+      log(LOG_WARNING, TAG, `Manual peer sync failed: ${err.message}`);
+    });
+    return true;
+  }
+
+  _peerUnpeerRequest(data, remoteIdentity) {
+    if (!remoteIdentity) return ERROR_NO_IDENTITY;
+    if (!data || data.length !== 16) return ERROR_INVALID_DATA;
+    const destHash = new Uint8Array(data);
+    const hex = toHex(destHash);
+    if (!this.peers.has(hex)) return ERROR_NOT_FOUND;
+    this.unpeer(destHash);
+    return true;
   }
 
   /**
